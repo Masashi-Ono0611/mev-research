@@ -17,7 +17,7 @@ import time
 
 import requests
 
-DEFAULT_OUT = "swaps_24h.ndjson"
+DEFAULT_OUT = "ton-analysis/data/swaps_24h.ndjson"
 TON_ROUTER = "EQCS4UEa5UaJLzOyyKieqQOQ2P9M-7kXpkO5HnP3Bv250cN3"
 
 # Wallets to decide direction
@@ -58,7 +58,7 @@ def fetch_page(api_url: str, router: str, limit: int, before_lt: Optional[int], 
     params: Dict[str, Any] = {"limit": limit}
     if before_lt:
         params["before_lt"] = before_lt
-    headers: Dict[str, str] = {}
+    headers: Dict[str, str] = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     url = f"{api_url.rstrip('/')}/accounts/{router}/transactions"
@@ -83,6 +83,11 @@ def parse_swaps(tx: Dict[str, Any]) -> Iterable[SwapLog]:
     in_decoded = in_msg.get("decoded_body") or {}
     query_id = str(in_decoded.get("query_id", ""))
     in_amount = str(in_decoded.get("amount", ""))
+    if not in_amount:
+        # fallback to TON value when Jetton amount not present (e.g., pay_to_v2 paths)
+        val = in_msg.get("value")
+        if val is not None:
+            in_amount = str(val)
     sender = in_decoded.get("sender") or (in_msg.get("source") or {}).get("address", "")
 
     # Determine direction by source wallet
@@ -114,19 +119,12 @@ def parse_swaps(tx: Dict[str, Any]) -> Iterable[SwapLog]:
     )
 
 
-def fetch_all(api_url: str, router: str, limit: int, api_key: Optional[str]) -> List[SwapLog]:
-    before_lt: Optional[int] = None
+def fetch_all(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[SwapLog]:
+    payload = fetch_page(api_url, router, limit, before_lt, api_key)
+    txs = payload.get("transactions", [])
     swaps: List[SwapLog] = []
-    while True:
-        payload = fetch_page(api_url, router, limit, before_lt, api_key)
-        txs = payload.get("transactions", [])
-        if not txs:
-            break
-        for tx in txs:
-            swaps.extend(parse_swaps(tx))
-        # pagination: use the smallest lt - 1
-        min_lt = min(int(tx.get("lt", 0)) for tx in txs)
-        before_lt = max(min_lt - 1, 0)
+    for tx in txs:
+        swaps.extend(parse_swaps(tx))
     return swaps
 
 
@@ -138,7 +136,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="tonapi base URL",
     )
     parser.add_argument("--router", default=os.getenv("TON_ROUTER", TON_ROUTER), help="Router account address")
-    parser.add_argument("--limit", type=int, default=10, help="Page size (tonapi limit)")
+    parser.add_argument("--limit", type=int, default=30, help="Page size (tonapi limit)")
+    parser.add_argument("--before-lt", type=int, default=None, help="Optional before_lt for pagination anchor")
     parser.add_argument("--out", default=DEFAULT_OUT, help="NDJSON output path")
     parser.add_argument(
         "--api-key",
@@ -147,7 +146,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    swaps = fetch_all(api_url=args.api_url, router=args.router, limit=args.limit, api_key=args.api_key)
+    swaps = fetch_all(
+        api_url=args.api_url,
+        router=args.router,
+        limit=args.limit,
+        api_key=args.api_key,
+        before_lt=args.before_lt,
+    )
 
     with open(args.out, "w", encoding="utf-8") as f:
         for s in swaps:
