@@ -1,7 +1,7 @@
 """
-STON.fi swap fetcher via tonapi.io for a specific router account.
-- Pulls account transactions, matches In/Out by query_id, and outputs NDJSON swap records.
-- Direction is inferred by Jetton Notify source wallet (pTON vs USDT jetton wallets).
+STON.fi swap fetcher via tonapi.io (bundled by query_id).
+- 一発取得（limit指定のみ、ページングなし）
+- Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を query_id でまとめ、direction/in/out/rate 付きで NDJSON 出力
 """
 
 from __future__ import annotations
@@ -10,51 +10,29 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
-
-import time
+from decimal import Decimal, InvalidOperation, getcontext
+from typing import Any, Dict, List, Optional
 
 import requests
 
 DEFAULT_OUT = "ton-analysis/data/swaps_24h.ndjson"
 TON_ROUTER = "EQCS4UEa5UaJLzOyyKieqQOQ2P9M-7kXpkO5HnP3Bv250cN3"
 
+# precision for rate
+getcontext().prec = 28
+
+# opcodes
+IN_OP_NOTIFY = "0x7362d09c"
+IN_OP_PAY_V2 = "0x657b54f5"
+OUT_OP_SWAP_V2 = "0x6664de2a"
+OUT_OP_TRANSFER = "0x0f8a7ea5"
+
 # Wallets to decide direction
-PTON_WALLET = "0:922d627d7d8edbd00e4e23bdb0c54a76ee5e1f46573a1af4417857fa3e23e91f"  # Proxy TON pTON
-USDT_WALLET = "0:9220c181a6cfeacd11b7b8f62138df1bb9cc82b6ed2661d2f5faee204b3efb20"  # Tether USD
+PTON_WALLET = "0:922d627d7d8edbd00e4e23bdb0c54a76ee5e1f46573a1af4417857fa3e23e91f"
+USDT_WALLET = "0:9220c181a6cfeacd11b7b8f62138df1bb9cc82b6ed2661d2f5faee204b3efb20"
 
 
-@dataclass
-class SwapLog:
-    tx_hash: str
-    lt: int
-    utime: int
-    direction: str  # "TON->USDT" or "USDT->TON" or "unknown"
-    query_id: str
-    sender: str
-    in_amount: str
-    out_amount: str
-    raw: Dict[str, Any]
-
-    def to_json(self) -> str:
-        return json.dumps(
-            {
-                "tx_hash": self.tx_hash,
-                "lt": self.lt,
-                "utime": self.utime,
-                "direction": self.direction,
-                "query_id": self.query_id,
-                "sender": self.sender,
-                "in_amount": self.in_amount,
-                "out_amount": self.out_amount,
-                "raw": self.raw,
-            },
-            ensure_ascii=False,
-        )
-
-
-def fetch_page(api_url: str, router: str, limit: int, before_lt: Optional[int], api_key: Optional[str]) -> Dict[str, Any]:
+def fetch_once(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {"limit": limit}
     if before_lt:
         params["before_lt"] = before_lt
@@ -64,114 +42,147 @@ def fetch_page(api_url: str, router: str, limit: int, before_lt: Optional[int], 
     url = f"{api_url.rstrip('/')}/accounts/{router}/transactions"
     resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    return resp.json().get("transactions", [])
 
 
-def infer_direction(from_wallet: str) -> str:
-    if from_wallet.lower() == PTON_WALLET.lower():
+def infer_direction(parts: Dict[str, Any]) -> str:
+    def norm(addr: str) -> str:
+        return (addr or "").lower()
+
+    transfer = parts.get("transfer") or {}
+    t_dest = norm(((transfer.get("out_msg") or {}).get("decoded_body") or {}).get("destination", ""))
+    if t_dest == norm(USDT_WALLET):
         return "TON->USDT"
-    if from_wallet.lower() == USDT_WALLET.lower():
+    if t_dest == norm(PTON_WALLET):
         return "USDT->TON"
-    # For debugging, return the raw address when it doesn't match either wallet
-    return from_wallet or "unknown"
+
+    notify = parts.get("notify") or {}
+    n_sender = norm(((notify.get("in_msg") or {}).get("decoded_body") or {}).get("sender", ""))
+    if n_sender == norm(USDT_WALLET):
+        return "USDT->TON"
+    if n_sender == norm(PTON_WALLET):
+        return "TON->USDT"
+
+    swap = parts.get("swap") or {}
+    token_wallet1 = norm(((swap.get("out_msg") or {}).get("decoded_body") or {}).get("dex_payload", {}).get("token_wallet1", ""))
+    if token_wallet1 == norm(USDT_WALLET):
+        return "TON->USDT"
+    if token_wallet1 == norm(PTON_WALLET):
+        return "USDT->TON"
+
+    return "unknown"
 
 
-def parse_swaps(tx: Dict[str, Any]) -> Iterable[SwapLog]:
-    tx_hash = tx.get("hash", "")
-    lt = int(tx.get("lt", 0))
-    utime = int(tx.get("utime", 0))
+def extract_meta(parts: Dict[str, Any]) -> Dict[str, Any]:
+    notify = parts.get("notify") or {}
+    transfer = parts.get("transfer") or {}
 
-    in_msg = tx.get("in_msg") or {}
-    in_op = in_msg.get("op_code", "").lower()
-    if in_op != "0x7362d09c":  # Jetton Notify only
-        return []
+    def pick_lt_utime(msg: Dict[str, Any]) -> Dict[str, Any]:
+        lt = (msg.get("in_msg") or msg.get("out_msg") or {}).get("created_lt")
+        utime = (msg.get("in_msg") or msg.get("out_msg") or {}).get("created_at")
+        return {"lt": lt, "utime": utime}
 
-    in_decoded = in_msg.get("decoded_body") or {}
-    query_id = str(in_decoded.get("query_id", ""))
-    in_amount = str(in_decoded.get("amount", ""))
-    if not in_amount:
-        # fallback to TON value when Jetton amount not present (e.g., pay_to_v2 paths)
-        val = in_msg.get("value")
-        if val is not None:
-            in_amount = str(val)
+    n_meta = pick_lt_utime(notify) if notify else {"lt": None, "utime": None}
+    t_meta = pick_lt_utime(transfer) if transfer else {"lt": None, "utime": None}
 
-    sender = in_decoded.get("sender") or (in_msg.get("source") or {}).get("address", "")
+    lt = n_meta.get("lt") or t_meta.get("lt")
+    utime = n_meta.get("utime") or t_meta.get("utime")
+    return {"lt": lt, "utime": utime}
 
-    # Determine direction by source wallet (Jetton Notify source is jetton wallet)
-    source_addr = (in_msg.get("source") or {}).get("address", "")
-    direction = infer_direction(source_addr)
 
-    # Collect Jetton Transfer out_msgs only
-    out_msgs = tx.get("out_msgs") or []
-    transfer_outs = [om for om in out_msgs if (om.get("op_code", "").lower()) == "0x0f8a7ea5"]
-    if not transfer_outs:
-        return []
+def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    def d(val: Any) -> Optional[Decimal]:
+        try:
+            return Decimal(str(val))
+        except (InvalidOperation, TypeError):
+            return None
 
-    # If query_id exists, prefer matching; else take first transfer
-    selected_out = None
-    if query_id:
-        for om in transfer_outs:
-            od = om.get("decoded_body") or {}
-            if str(od.get("query_id", "")) == query_id:
-                selected_out = om
-                break
-    if selected_out is None:
-        selected_out = transfer_outs[0]
+    notify = (parts.get("notify") or {}).get("in_msg") or {}
+    swap = (parts.get("swap") or {}).get("out_msg") or {}
+    pay = (parts.get("pay") or {}).get("in_msg") or {}
+    transfer = (parts.get("transfer") or {}).get("out_msg") or {}
 
-    od = selected_out.get("decoded_body") or {}
-    out_amount = str(od.get("amount", ""))
+    in_amt = None
+    out_amt = None
 
-    if not out_amount:
-        return []
+    if direction == "TON->USDT":
+        in_amt = d(((notify.get("decoded_body") or {}).get("amount")))
+        if in_amt is None:
+            in_amt = d(((pay.get("decoded_body") or {}).get("amount0_out")))
+        out_amt = d(((transfer.get("decoded_body") or {}).get("amount")))
+    elif direction == "USDT->TON":
+        in_amt = d(((swap.get("decoded_body") or {}).get("right_amount")))
+        if in_amt is None:
+            in_amt = d(((pay.get("decoded_body") or {}).get("amount1_out")))
+        out_amt = d(((transfer.get("decoded_body") or {}).get("amount")))
 
-    # Raw output should focus on the relevant messages only
-    filtered_raw = {
-        "hash": tx_hash,
-        "lt": lt,
-        "utime": utime,
-        "in_msg": in_msg,
-        "out_msg": selected_out,
+    rate = None
+    if in_amt and out_amt and in_amt != 0:
+        try:
+            rate = (out_amt / in_amt).quantize(Decimal("1.000000000000000000"))
+        except InvalidOperation:
+            rate = None
+
+    return {
+        "in_amount": str(in_amt) if in_amt is not None else None,
+        "out_amount": str(out_amt) if out_amt is not None else None,
+        "rate": str(rate) if rate is not None else None,
     }
 
-    yield SwapLog(
-        tx_hash=tx_hash,
-        lt=lt,
-        utime=utime,
-        direction=direction,
-        query_id=query_id,
-        sender=sender or "",
-        in_amount=in_amount,
-        out_amount=out_amount,
-        raw=filtered_raw,
-    )
 
+def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for tx in txs:
+        in_msg = tx.get("in_msg") or {}
+        out_msgs = tx.get("out_msgs") or []
 
-def fetch_all(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[SwapLog]:
-    swaps: List[SwapLog] = []
-    seen_lts = set()
+        in_op = (in_msg.get("op_code", "") or "").lower()
+        role = None
+        qid = None
+        if in_op in {IN_OP_NOTIFY, IN_OP_PAY_V2}:
+            qid = str((in_msg.get("decoded_body") or {}).get("query_id", ""))
+            role = "notify" if in_op == IN_OP_NOTIFY else "pay"
+        if qid in (None, ""):
+            for om in out_msgs:
+                od = om.get("decoded_body") or {}
+                qid = str(od.get("query_id", ""))
+                if qid:
+                    break
+        if not qid:
+            continue
 
-    while True:
-        payload = fetch_page(api_url, router, limit, before_lt, api_key)
-        txs = payload.get("transactions", [])
-        if not txs:
-            break
+        bucket = buckets.setdefault(qid, {"notify": None, "swap": None, "pay": None, "transfer": None})
 
-        for tx in txs:
-            swaps.extend(parse_swaps(tx))
+        if role == "notify":
+            bucket["notify"] = {"tx_hash": tx.get("hash"), "in_msg": in_msg}
+            for om in out_msgs:
+                if (om.get("op_code", "") or "").lower() == OUT_OP_SWAP_V2:
+                    bucket["swap"] = {"tx_hash": tx.get("hash"), "out_msg": om}
+        elif role == "pay":
+            bucket["pay"] = {"tx_hash": tx.get("hash"), "in_msg": in_msg}
+            for om in out_msgs:
+                if (om.get("op_code", "") or "").lower() == OUT_OP_TRANSFER:
+                    bucket["transfer"] = {"tx_hash": tx.get("hash"), "out_msg": om}
+        else:
+            for om in out_msgs:
+                op = (om.get("op_code", "") or "").lower()
+                if op == OUT_OP_SWAP_V2 and bucket.get("swap") is None:
+                    bucket["swap"] = {"tx_hash": tx.get("hash"), "out_msg": om}
+                if op == OUT_OP_TRANSFER and bucket.get("transfer") is None:
+                    bucket["transfer"] = {"tx_hash": tx.get("hash"), "out_msg": om}
 
-        last_lt = txs[-1].get("lt")
-        if last_lt is None or last_lt in seen_lts:
-            break
-        seen_lts.add(last_lt)
+    rows: List[Dict[str, Any]] = []
+    for qid, parts in buckets.items():
+        if not any(parts.values()):
+            continue
+        direction = infer_direction(parts)
+        if direction == "unknown":
+            continue
+        meta = extract_meta(parts)
+        amounts = compute_amounts(parts, direction)
+        rows.append({"query_id": qid, "direction": direction, **meta, **amounts, **parts})
 
-        # Prepare next page anchor
-        before_lt = int(last_lt)
-
-        # If fewer than requested, no more pages
-        if len(txs) < limit:
-            break
-
-    return swaps
+    return rows
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -192,19 +203,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    swaps = fetch_all(
-        api_url=args.api_url,
-        router=args.router,
-        limit=args.limit,
-        api_key=args.api_key,
-        before_lt=args.before_lt,
-    )
+    txs = fetch_once(api_url=args.api_url, router=args.router, limit=args.limit, api_key=args.api_key, before_lt=args.before_lt)
+    rows = build_bundles(txs)
 
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
-        for s in swaps:
-            f.write(s.to_json() + "\n")
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(f"fetched {len(swaps)} swaps -> {args.out}")
+    print(f"fetched {len(rows)} query_id bundles -> {args.out}")
     return 0
 
 

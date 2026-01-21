@@ -60,7 +60,10 @@
   - `transfer` (out_msg→decoded_body.amount/destination)
 - `direction` と `in/out amount` から実効レート・スリッページを計算可能（Jetton decimals は別途考慮）。
 - 24h分を `before_lt` でページングしてNDJSONに保存し、後段のノートで集計・検知に用いる。
-- 24h分を `before_lt` でページングしてNDJSONに保存し、後段のノートで集計・検知に用いる。
+
+#### スクリプト整理
+- `scripts/fetch_swaps.py`: 本番用。query_id で Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/swaps_24h.ndjson`。ページングなしの単発取得（limit 指定のみ）。direction が `unknown` の行は除外。
+- `scripts/debug_extract_opcodes.py`: デバッグ用の軽量版。動作・出力フォーマットは fetch_swaps.py と同等（direction/in/out/rate 含む）が、用途は調査・比較に限定。
 
 #### tonapiレスポンスで確認できた項目（サンプル取得より）
 - トップレベル: `hash`, `lt`, `utime`, `block`, `total_fees`
