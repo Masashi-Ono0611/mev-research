@@ -149,6 +149,32 @@ def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
     }
 
 
+def is_successful_swap(parts: Dict[str, Any], direction: str, amounts: Dict[str, Any]) -> bool:
+    """判定: 返金(Repay)を除外するための成功条件。
+
+    - pay.in_msg.decoded_body.exit_code が通常成功(3326308581)であること
+    - 出力トークン量が0でないこと（TON->USDTはamount1_out、USDT->TONはamount0_out）
+    """
+
+    pay_decoded = ((parts.get("pay") or {}).get("in_msg") or {}).get("decoded_body") or {}
+    exit_code = pay_decoded.get("exit_code")
+
+    # 正常終了コードでなければ失敗扱い
+    if exit_code != 3326308581:
+        return False
+
+    add_info = pay_decoded.get("additional_info") or {}
+    out_amt_str = amounts.get("out_amount")
+
+    if direction == "TON->USDT":
+        # USDT出力が0なら返金とみなす
+        amount1_out = add_info.get("amount1_out")
+        return bool(amount1_out) and amount1_out != "0" and out_amt_str not in (None, "0")
+    else:  # USDT->TON
+        amount0_out = add_info.get("amount0_out")
+        return bool(amount0_out) and amount0_out != "0" and out_amt_str not in (None, "0")
+
+
 def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = {}
     for tx in txs:
@@ -199,6 +225,8 @@ def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         meta = extract_meta(parts)
         amounts = compute_amounts(parts, direction)
+        if not is_successful_swap(parts, direction, amounts):
+            continue
         rows.append({"query_id": qid, "direction": direction, **meta, **amounts, **parts})
 
     return rows
