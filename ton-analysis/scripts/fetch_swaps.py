@@ -32,7 +32,7 @@ PTON_WALLET = "0:922d627d7d8edbd00e4e23bdb0c54a76ee5e1f46573a1af4417857fa3e23e91
 USDT_WALLET = "0:9220c181a6cfeacd11b7b8f62138df1bb9cc82b6ed2661d2f5faee204b3efb20"
 
 
-def fetch_once(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
+def fetch_page(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {"limit": limit}
     if before_lt:
         params["before_lt"] = before_lt
@@ -43,6 +43,25 @@ def fetch_once(api_url: str, router: str, limit: int, api_key: Optional[str], be
     resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json().get("transactions", [])
+
+
+def fetch_pages(api_url: str, router: str, limit: int, pages: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
+    all_txs: List[Dict[str, Any]] = []
+    cursor = before_lt
+    for _ in range(max(1, pages)):
+        txs = fetch_page(api_url, router, limit, api_key, cursor)
+        if not txs:
+            break
+        all_txs.extend(txs)
+        if len(txs) < limit:
+            break
+        # advance cursor to fetch older txs
+        try:
+            min_lt = min(int(t.get("lt", 0)) for t in txs if t.get("lt") is not None)
+        except ValueError:
+            break
+        cursor = min_lt - 1
+    return all_txs
 
 
 def infer_direction(parts: Dict[str, Any]) -> str:
@@ -194,6 +213,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--router", default=os.getenv("TON_ROUTER", TON_ROUTER), help="Router account address")
     parser.add_argument("--limit", type=int, default=30, help="Page size (tonapi limit)")
+    parser.add_argument("--pages", type=int, default=1, help="How many pages to fetch (pagination backward by lt)")
     parser.add_argument("--before-lt", type=int, default=None, help="Optional before_lt for pagination anchor")
     parser.add_argument("--out", default=DEFAULT_OUT, help="NDJSON output path")
     parser.add_argument(
@@ -203,7 +223,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    txs = fetch_once(api_url=args.api_url, router=args.router, limit=args.limit, api_key=args.api_key, before_lt=args.before_lt)
+    txs = fetch_pages(
+        api_url=args.api_url,
+        router=args.router,
+        limit=args.limit,
+        pages=args.pages,
+        api_key=args.api_key,
+        before_lt=args.before_lt,
+    )
     rows = build_bundles(txs)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
