@@ -287,6 +287,31 @@ def main():
             f"VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
         )
 
+    # Backrun candidates (victim then opposite-direction tx that benefits from victim move)
+    backrun_pairs = []
+    for i in range(1, len(rows)):
+        v = rows[i - 1]
+        b = rows[i]
+        if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT":
+            if v.get("rate1000") is not None and b.get("rate1000") is not None:
+                # victim buys (price up), backrun sells at higher price => backrun rate higher
+                if b["rate1000"] > v["rate1000"]:
+                    backrun_pairs.append((v, b))
+        elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON":
+            if v.get("rate1000") is not None and b.get("rate1000") is not None:
+                # victim sells (price down), backrun buys cheaper => backrun rate lower
+                if b["rate1000"] < v["rate1000"]:
+                    backrun_pairs.append((v, b))
+
+    print("\nBackrun candidates (victim then opposite direction, backrunner benefits, adjacent next tx, block not considered)")
+    print(f"count: {len(backrun_pairs)}")
+    for v, b in backrun_pairs:
+        dt = b.get("utime", 0) - v.get("utime", 0)
+        print(
+            f"dt={dt}s | VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
+            f"BACKRUN qid={b.get('query_id')} utime={b.get('utime')} lt={b.get('lt')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
+        )
+
     # Same-block (notify-based block_key) frontrun candidates using primary_lt order
     print("\nSame-block frontrun candidates (notify block, primary_lt order, victim worse; block considered)")
     if FETCH_BLOCKS:
@@ -328,6 +353,37 @@ def main():
             print(
                 f"block={bk} | dt={dt}s | FR qid={fr.get('query_id')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
                 f"VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
+            )
+    else:
+        print("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
+
+    # Same-block backrun candidates (opposite direction, backrunner benefits)
+    print("\nSame-block backrun candidates (notify block, primary_lt order, backrunner benefits; block considered)")
+    if FETCH_BLOCKS:
+        back_block_pairs = []
+        by_block = {}
+        for r in rows:
+            bk = r.get("block_key")
+            if not bk:
+                continue
+            by_block.setdefault(bk, []).append(r)
+        for bk, arr in by_block.items():
+            arr.sort(key=lambda x: x.get("primary_lt", 0))
+            for i in range(1, len(arr)):
+                v = arr[i - 1]
+                b = arr[i]
+                if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT":
+                    if v.get("rate1000") is not None and b.get("rate1000") is not None and b["rate1000"] > v["rate1000"]:
+                        back_block_pairs.append((bk, v, b))
+                elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON":
+                    if v.get("rate1000") is not None and b.get("rate1000") is not None and b["rate1000"] < v["rate1000"]:
+                        back_block_pairs.append((bk, v, b))
+        print(f"count: {len(back_block_pairs)}")
+        for bk, v, b in back_block_pairs:
+            dt = b.get("utime", 0) - v.get("utime", 0)
+            print(
+                f"block={bk} | dt={dt}s | VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
+                f"BACKRUN qid={b.get('query_id')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
             )
     else:
         print("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
