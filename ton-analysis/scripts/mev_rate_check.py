@@ -1,15 +1,83 @@
 import json
+import os
+import time
+import urllib.parse
 import statistics
 from decimal import Decimal
 from pathlib import Path
+import requests
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "swaps_sample.ndjson"
 SCALE = Decimal(1000)
+TON_API_BASE = os.getenv("TON_API_BASE_URL") or os.getenv("NEXT_PUBLIC_TON_API_BASE_URL") or "https://tonapi.io"
+FETCH_BLOCKS = (os.getenv("MEV_FETCH_BLOCKS") or "true").lower() in ("1", "true", "yes", "on")
 
 
 def load_rows(path: Path):
     with path.open() as f:
         return [json.loads(line) for line in f]
+
+
+def extract_primary_lt(row: dict) -> int | None:
+    """Prefer notify.in_msg.created_lt (Jetton Notify), fallback to others."""
+    # primary choice: Jetton Notify in_msg
+    notify_lt = None
+    try:
+        notify_lt = int((((row.get("notify") or {}).get("in_msg") or {}).get("created_lt")) or 0)
+    except Exception:
+        notify_lt = None
+    if notify_lt:
+        return notify_lt
+
+    lts = []
+    # swap out_msg
+    try:
+        lts.append(int((((row.get("swap") or {}).get("out_msg") or {}).get("created_lt")) or 0))
+    except Exception:
+        pass
+    # pay in_msg
+    try:
+        lts.append(int((((row.get("pay") or {}).get("in_msg") or {}).get("created_lt")) or 0))
+    except Exception:
+        pass
+    # transfer out_msg
+    try:
+        lts.append(int((((row.get("transfer") or {}).get("out_msg") or {}).get("created_lt")) or 0))
+    except Exception:
+        pass
+    lts = [lt for lt in lts if lt]
+    return min(lts) if lts else None
+
+
+def extract_notify_hash(row: dict) -> str | None:
+    return ((row.get("notify") or {}).get("tx_hash")) or None
+
+
+def fetch_block_id(tx_hash: str) -> dict | None:
+    if not tx_hash:
+        return None
+    url = urllib.parse.urljoin(TON_API_BASE, f"/v2/blockchain/transactions/{tx_hash}")
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        # tonapi sometimes nests block info under block_id or block
+        blk = data.get("block_id") or data.get("block") or {}
+        wc = blk.get("workchain") if isinstance(blk, dict) else None
+        shard = blk.get("shard") if isinstance(blk, dict) else None
+        seqno = blk.get("seqno") if isinstance(blk, dict) else None
+        if wc is None or shard is None or seqno is None:
+            return None
+        return {"workchain": wc, "shard": shard, "seqno": seqno}
+    except Exception:
+        return None
+
+
+def block_key(bid: dict | None) -> str | None:
+    if not bid:
+        return None
+    return f"{bid.get('workchain')}:{bid.get('shard')}:{bid.get('seqno')}"
 
 
 def compute_rates(rows):
@@ -23,6 +91,8 @@ def compute_rates(rows):
         rates.append(val * SCALE)
         if r["direction"] in rates_by_dir:
             rates_by_dir[r["direction"]].append(val * SCALE)
+        # store per-row scaled rate for later use
+        r["rate1000"] = float(val * SCALE)
     return rates, rates_by_dir
 
 
@@ -78,6 +148,30 @@ def extract_min_out(row: dict) -> Decimal | None:
 
 def main():
     rows = load_rows(DATA_PATH)
+    # attach primary_lt for ordering (smallest created_lt among component msgs)
+    for r in rows:
+        r["primary_lt"] = extract_primary_lt(r) or r.get("lt")
+    # fetch block info using notify tx_hash (Jetton Notify)
+    if FETCH_BLOCKS:
+        block_cache = {}
+        for r in rows:
+            txh = extract_notify_hash(r)
+            if txh in block_cache:
+                bid = block_cache[txh]
+            else:
+                bid = fetch_block_id(txh)
+                block_cache[txh] = bid
+                # small politeness pause to avoid spamming
+                time.sleep(0.05)
+            r["block_id"] = bid
+            r["block_key"] = block_key(bid)
+    else:
+        for r in rows:
+            r["block_id"] = None
+            r["block_key"] = None
+
+    # sort by primary_lt, then utime as tiebreaker
+    rows.sort(key=lambda x: (x.get("primary_lt", 0), x.get("utime", 0)))
     scaled_rates, rates_by_dir = compute_rates(rows)
     summary = summarize("USDT/TON *1000", scaled_rates)
 
@@ -145,6 +239,64 @@ def main():
                 f"query_id={d['query_id']}, dir={d['direction']}, lt={d['lt']}, "
                 f"hit_pct={d['hit_pct']:.4f}% (min_out={d['min_out']}, actual_out={d['out_amount']})"
             )
+
+    # Same-direction frontrun candidates (victim worse), adjacency-based (previous tx only)
+    fr_pairs = []
+    for i in range(1, len(rows)):
+        fr = rows[i - 1]
+        v = rows[i]
+        if fr.get("direction") != v.get("direction"):
+            continue
+        # victim worse: TON->USDT is worse if rate1000 drops; USDT->TON is worse if rate1000 rises
+        if v["direction"] == "TON->USDT" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
+            if v["rate1000"] < fr["rate1000"]:
+                fr_pairs.append((fr, v))
+        elif v["direction"] == "USDT->TON" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
+            if v["rate1000"] > fr["rate1000"]:
+                fr_pairs.append((fr, v))
+
+    print("\nSame-direction frontrun candidates (victim worse, adjacent prev tx, block not considered)")
+    print(f"count: {len(fr_pairs)}")
+    for fr, v in fr_pairs:
+        dt = v.get("utime", 0) - fr.get("utime", 0)
+        print(
+            f"dt={dt}s | FR qid={fr.get('query_id')} utime={fr.get('utime')} lt={fr.get('lt')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
+            f"VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
+        )
+
+    # Same-block (notify-based block_key) frontrun candidates using primary_lt order
+    print("\nSame-block frontrun candidates (notify block, primary_lt order, victim worse; block considered)")
+    if FETCH_BLOCKS:
+        same_block_pairs = []
+        by_block = {}
+        for r in rows:
+            bk = r.get("block_key")
+            if not bk:
+                continue
+            by_block.setdefault(bk, []).append(r)
+        for bk, arr in by_block.items():
+            arr.sort(key=lambda x: x.get("primary_lt", 0))
+            for i in range(1, len(arr)):
+                fr = arr[i - 1]
+                v = arr[i]
+                if fr.get("direction") != v.get("direction"):
+                    continue
+                if v["direction"] == "TON->USDT" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
+                    if v["rate1000"] < fr["rate1000"]:
+                        same_block_pairs.append((bk, fr, v))
+                elif v["direction"] == "USDT->TON" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
+                    if v["rate1000"] > fr["rate1000"]:
+                        same_block_pairs.append((bk, fr, v))
+
+        print(f"count: {len(same_block_pairs)}")
+        for bk, fr, v in same_block_pairs:
+            dt = v.get("utime", 0) - fr.get("utime", 0)
+            print(
+                f"block={bk} | dt={dt}s | FR qid={fr.get('query_id')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
+                f"VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
+            )
+    else:
+        print("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
 
 
 if __name__ == "__main__":
