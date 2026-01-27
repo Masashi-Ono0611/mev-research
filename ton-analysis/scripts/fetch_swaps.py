@@ -255,8 +255,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="tonapi base URL",
     )
     parser.add_argument("--router", default=os.getenv("TON_ROUTER", TON_ROUTER), help="Router account address")
-    parser.add_argument("--limit", type=int, default=30, help="Page size (tonapi limit)")
-    parser.add_argument("--pages", type=int, default=1, help="How many pages to fetch (pagination backward by lt)")
+    parser.add_argument("--limit", type=int, default=50, help="Page size (tonapi limit)")
+    parser.add_argument("--pages", type=int, default=20, help="How many pages to fetch (pagination backward by lt)")
     parser.add_argument("--before-lt", type=int, default=None, help="Optional before_lt for pagination anchor")
     parser.add_argument("--max-age-mins", type=int, default=None, help="Stop when tx utime older than now - max_age_min")
     parser.add_argument("--out", default=DEFAULT_OUT, help="NDJSON output path")
