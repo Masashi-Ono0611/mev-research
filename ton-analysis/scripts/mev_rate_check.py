@@ -5,6 +5,8 @@ import urllib.parse
 import statistics
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
+
 import requests
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "swaps_sample.ndjson"
@@ -18,7 +20,7 @@ def load_rows(path: Path):
         return [json.loads(line) for line in f]
 
 
-def extract_primary_lt(row: dict) -> int | None:
+def extract_primary_lt(row: dict) -> Optional[int]:
     """Prefer notify.in_msg.created_lt (Jetton Notify), fallback to others."""
     # primary choice: Jetton Notify in_msg
     notify_lt = None
@@ -49,14 +51,14 @@ def extract_primary_lt(row: dict) -> int | None:
     return min(lts) if lts else None
 
 
-def extract_notify_hash(row: dict) -> str | None:
+def extract_notify_hash(row: dict) -> Optional[str]:
     return ((row.get("notify") or {}).get("tx_hash")) or None
 
 
-def fetch_block_id(tx_hash: str) -> dict | None:
+def fetch_block_id(tx_hash: str) -> Optional[dict]:
     if not tx_hash:
         return None
-    def parse_block_str(s: str) -> dict | None:
+    def parse_block_str(s: str) -> Optional[dict]:
         try:
             if s.startswith("(") and s.endswith(")"):
                 items = s.strip("()").split(",")
@@ -91,7 +93,7 @@ def fetch_block_id(tx_hash: str) -> dict | None:
     return None
 
 
-def block_key(bid: dict | None) -> str | None:
+def block_key(bid: Optional[dict]) -> Optional[str]:
     if not bid:
         return None
     return f"{bid.get('workchain')}:{bid.get('shard')}:{bid.get('seqno')}"
@@ -111,6 +113,36 @@ def compute_rates(rows):
         # store per-row scaled rate for later use
         r["rate1000"] = float(val * SCALE)
     return rates, rates_by_dir
+
+
+def sanity_filter(rows):
+    """Filter obvious outliers by loose direction-specific ranges.
+
+    Rationale (keep simple):
+    - USDT->TON expected rate ~0.0015 (USDT/TON). TON<->TON swaps show rate≈1, so drop anything >0.01 or <1e-6.
+    - TON->USDT expected ~600-700 (TON/USDT inverse). Drop anything far outside 10-5000 to avoid dividing errors/extremes.
+    """
+
+    filtered = []
+    dropped = []
+    for r in rows:
+        try:
+            rate = Decimal(r["rate"])
+        except Exception:
+            dropped.append((r, "rate_parse_error"))
+            continue
+
+        if r.get("direction") == "USDT->TON":
+            if rate <= Decimal("1e-6") or rate >= Decimal("0.01"):
+                dropped.append((r, "usdt_ton_sanity"))
+                continue
+        elif r.get("direction") == "TON->USDT":
+            if rate <= Decimal("10") or rate >= Decimal("5000"):
+                dropped.append((r, "ton_usdt_sanity"))
+                continue
+        filtered.append(r)
+
+    return filtered, dropped
 
 
 def summarize(name: str, values):
@@ -134,7 +166,7 @@ def format_stats(label: str, stats: dict) -> str:
     )
 
 
-def extract_min_out(row: dict) -> Decimal | None:
+def extract_min_out(row: dict) -> Optional[Decimal]:
     """Attempt to extract min_out (as Decimal) from known payload paths."""
     # Path 1: swap.out_msg.decoded_body.dex_payload.swap_body.min_out
     sb1 = (((row.get("swap") or {}).get("out_msg") or {}).get("decoded_body") or {}).get(
@@ -168,9 +200,24 @@ def main():
 
     parser = argparse.ArgumentParser(description="MEV rate check")
     parser.add_argument("--data", default=str(DEFAULT_DATA_PATH), help="NDJSON swaps file")
+    parser.add_argument("--out", default=None, help="Optional output path for summary text (saved in addition to stdout)")
     args = parser.parse_args()
 
+    out_lines = []
+
+    def emit(msg: str = "") -> None:
+        out_lines.append(msg)
+        print(msg)
+
     rows = load_rows(Path(args.data))
+    rows, dropped = sanity_filter(rows)
+    emit(f"Applied sanity filter: kept={len(rows)}, dropped={len(dropped)}")
+    if dropped:
+        emit("Dropped samples (up to 5):")
+        for r, reason in dropped[:5]:
+            emit(
+                f"  reason={reason} dir={r.get('direction')} rate={r.get('rate')} qid={r.get('query_id')} in={r.get('in_amount')} out={r.get('out_amount')}"
+            )
     # attach primary_lt for ordering (smallest created_lt among component msgs)
     for r in rows:
         r["primary_lt"] = extract_primary_lt(r) or r.get("lt")
@@ -199,17 +246,17 @@ def main():
     summary = summarize("USDT/TON *1000", scaled_rates)
 
     # Direction-wise summary first
-    print("=== Direction breakdown: USDT/TON decimal-adjusted (scaled by 1000) ===")
+    emit("=== Direction breakdown: USDT/TON decimal-adjusted (scaled by 1000) ===")
     for direction, vals in rates_by_dir.items():
         if not vals:
             continue
         s = summarize(direction, vals)
-        print(format_stats(direction, s))
+        emit(format_stats(direction, s))
 
     # Overall summary next
-    print("\n=== USDT/TON decimal-adjusted (scaled by 1000) ===")
+    emit("\n=== USDT/TON decimal-adjusted (scaled by 1000) ===")
     for k in ["count", "min", "max", "median", "mean", "stdev"]:
-        print(f"{k}: {summary[k]}")
+        emit(f"{k}: {summary[k]}")
 
     # min_out vs actual_out comparison
     coverage = []  # entries with min_out present
@@ -242,23 +289,23 @@ def main():
             }
         )
 
-    print("\nmin_out coverage (actual_out vs min_out)")
-    print(f"with_min_out: {len(coverage)}, missing_or_invalid: {missing_min_out}")
+    emit("\nmin_out coverage (actual_out vs min_out)")
+    emit(f"with_min_out: {len(coverage)}, missing_or_invalid: {missing_min_out}")
 
     hit_values = [c["hit_pct"] for c in coverage if c["hit_pct"] is not None]
     if hit_values:
-        print(
+        emit(
             f"hit_pct stats (min_out/actual_out * 100): min={min(hit_values):.4f}, "
             f"max={max(hit_values):.4f}, median={statistics.median(hit_values):.4f}, "
             f"mean={statistics.mean(hit_values):.4f}"
         )
 
         # Top cases closest to min_out (highest hit_pct)
-        print("\nTop swaps closest to min_out (desc by hit_pct)")
+        emit("\nTop swaps closest to min_out (desc by hit_pct)")
         for d in sorted(coverage, key=lambda x: (x["hit_pct"] is not None, x["hit_pct"]), reverse=True)[:5]:
             if d["hit_pct"] is None:
                 continue
-            print(
+            emit(
                 f"query_id={d['query_id']}, dir={d['direction']}, lt={d['lt']}, "
                 f"hit_pct={d['hit_pct']:.4f}% (min_out={d['min_out']}, actual_out={d['out_amount']})"
             )
@@ -278,11 +325,11 @@ def main():
             if v["rate1000"] > fr["rate1000"]:
                 fr_pairs.append((fr, v))
 
-    print("\nSame-direction frontrun candidates (victim worse, adjacent prev tx, block not considered)")
-    print(f"count: {len(fr_pairs)}")
+    emit("\nSame-direction frontrun candidates (victim worse, adjacent prev tx, block not considered)")
+    emit(f"count: {len(fr_pairs)}")
     for fr, v in fr_pairs:
         dt = v.get("utime", 0) - fr.get("utime", 0)
-        print(
+        emit(
             f"dt={dt}s | FR qid={fr.get('query_id')} utime={fr.get('utime')} lt={fr.get('lt')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
             f"VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
         )
@@ -303,17 +350,18 @@ def main():
                 if b["rate1000"] < v["rate1000"]:
                     backrun_pairs.append((v, b))
 
-    print("\nBackrun candidates (victim then opposite direction, backrunner benefits, adjacent next tx, block not considered)")
-    print(f"count: {len(backrun_pairs)}")
+    emit("\nBackrun candidates (victim then opposite-direction tx that benefits from victim move)")
+    emit(f"count: {len(backrun_pairs)}")
     for v, b in backrun_pairs:
         dt = b.get("utime", 0) - v.get("utime", 0)
-        print(
+        emit(
             f"dt={dt}s | VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
             f"BACKRUN qid={b.get('query_id')} utime={b.get('utime')} lt={b.get('lt')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
         )
 
     # Same-block (notify-based block_key) frontrun candidates using primary_lt order
-    print("\nSame-block frontrun candidates (notify block, primary_lt order, victim worse; block considered)")
+    emit("\nSame-block frontrun scan (notify block, primary_lt order, victim worse; block considered)")
+    emit("Listing blocks with >=2 swaps (not necessarily FR):")
     if FETCH_BLOCKS:
         same_block_pairs = []
         by_block = {}
@@ -324,12 +372,12 @@ def main():
             by_block.setdefault(bk, []).append(r)
 
         # debug: show block composition
-        print(f"blocks_with_tx: {len(by_block)}")
+        emit(f"blocks_with_tx: {len(by_block)}")
         multi = {bk: arr for bk, arr in by_block.items() if len(arr) > 1}
-        print(f"blocks_with_multiple_tx: {len(multi)}")
+        emit(f"blocks_with_multiple_tx (shown below): {len(multi)}")
         for bk, arr in sorted(multi.items(), key=lambda x: x[0])[:20]:
             arr_sorted = sorted(arr, key=lambda x: x.get("primary_lt", 0))
-            print(
+            emit(
                 f"block={bk} count={len(arr_sorted)} qids={[a.get('query_id') for a in arr_sorted]} "
                 f"primary_lt={[a.get('primary_lt') for a in arr_sorted]} dirs={[a.get('direction') for a in arr_sorted]}"
             )
@@ -347,18 +395,18 @@ def main():
                     if v["rate1000"] > fr["rate1000"]:
                         same_block_pairs.append((bk, fr, v))
 
-        print(f"count: {len(same_block_pairs)}")
+        emit(f"Same-block FR candidates (same direction, victim rate worse): count={len(same_block_pairs)}")
         for bk, fr, v in same_block_pairs:
             dt = v.get("utime", 0) - fr.get("utime", 0)
-            print(
+            emit(
                 f"block={bk} | dt={dt}s | FR qid={fr.get('query_id')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
                 f"VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
             )
     else:
-        print("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
+        emit("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
 
     # Same-block backrun candidates (opposite direction, backrunner benefits)
-    print("\nSame-block backrun candidates (notify block, primary_lt order, backrunner benefits; block considered)")
+    emit("\nSame-block backrun scan (notify block, primary_lt order, backrunner benefits; block considered)")
     if FETCH_BLOCKS:
         back_block_pairs = []
         by_block = {}
@@ -378,15 +426,21 @@ def main():
                 elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON":
                     if v.get("rate1000") is not None and b.get("rate1000") is not None and b["rate1000"] < v["rate1000"]:
                         back_block_pairs.append((bk, v, b))
-        print(f"count: {len(back_block_pairs)}")
+        emit(f"Same-block BR candidates (opposite direction, backrunner benefits): count={len(back_block_pairs)}")
         for bk, v, b in back_block_pairs:
             dt = b.get("utime", 0) - v.get("utime", 0)
-            print(
+            emit(
                 f"block={bk} | dt={dt}s | VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
                 f"BACKRUN qid={b.get('query_id')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
             )
     else:
-        print("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
+        emit("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(out_lines), encoding="utf-8")
+        emit(f"\nSaved summary to {out_path}")
 
 
 if __name__ == "__main__":
