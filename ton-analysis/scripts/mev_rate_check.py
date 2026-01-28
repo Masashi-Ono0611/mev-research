@@ -195,23 +195,198 @@ def extract_min_out(row: dict) -> Optional[Decimal]:
         return None
 
 
-def main():
+class Emitter:
+    def __init__(self):
+        self.lines = []
+
+    def emit(self, msg: str = "") -> None:
+        self.lines.append(msg)
+        print(msg)
+
+    def save(self, path: Optional[Path]):
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(self.lines), encoding="utf-8")
+        self.emit(f"\nSaved summary to {path}")
+
+
+def build_parser():
     import argparse
 
     parser = argparse.ArgumentParser(description="MEV rate check")
     parser.add_argument("--data", default=str(DEFAULT_DATA_PATH), help="NDJSON swaps file")
     parser.add_argument("--out", default=None, help="Optional output path for summary text (saved in addition to stdout)")
+    parser.add_argument(
+        "--enable-cross-block-br",
+        action="store_true",
+        help="Scan backrun across adjacent blocks (requires MEV_FETCH_BLOCKS=true)",
+    )
+    parser.add_argument(
+        "--block-gap",
+        type=int,
+        default=1,
+        help="Max block seqno gap for cross-block BR scan (same shard). Default 1",
+    )
+    return parser
+
+
+def compute_min_out_coverage(rows):
+    coverage = []
+    missing = 0
+    for r in rows:
+        min_out = extract_min_out(r)
+        try:
+            out_amt = Decimal(r["out_amount"])
+        except Exception:
+            out_amt = None
+        if min_out is None or out_amt is None or out_amt == 0:
+            missing += 1
+            continue
+        try:
+            hit_pct = (min_out / out_amt) * 100
+        except Exception:
+            hit_pct = None
+        coverage.append({
+            "query_id": r.get("query_id"),
+            "direction": r.get("direction"),
+            "lt": r.get("lt"),
+            "out_amount": out_amt,
+            "min_out": min_out,
+            "hit_pct": float(hit_pct) if hit_pct is not None else None,
+        })
+    return coverage, missing
+
+
+def scan_frontrun_adjacent(rows):
+    pairs = []
+    for i in range(1, len(rows)):
+        fr = rows[i - 1]
+        v = rows[i]
+        if fr.get("direction") != v.get("direction"):
+            continue
+        if v.get("rate1000") is None or fr.get("rate1000") is None:
+            continue
+        if v["direction"] == "TON->USDT" and v["rate1000"] < fr["rate1000"]:
+            pairs.append((fr, v))
+        elif v["direction"] == "USDT->TON" and v["rate1000"] > fr["rate1000"]:
+            pairs.append((fr, v))
+    return pairs
+
+
+def scan_backrun_adjacent(rows):
+    pairs = []
+    for i in range(1, len(rows)):
+        v = rows[i - 1]
+        b = rows[i]
+        if v.get("rate1000") is None or b.get("rate1000") is None:
+            continue
+        if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT" and b["rate1000"] > v["rate1000"]:
+            pairs.append((v, b))
+        elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON" and b["rate1000"] < v["rate1000"]:
+            pairs.append((v, b))
+    return pairs
+
+
+def build_block_index(rows):
+    by_block = {}
+    for r in rows:
+        bk = r.get("block_key")
+        if not bk:
+            continue
+        by_block.setdefault(bk, []).append(r)
+    for bk in by_block:
+        by_block[bk].sort(key=lambda x: x.get("primary_lt", 0))
+    return by_block
+
+
+def scan_same_block_fr(by_block):
+    pairs = []
+    for bk, arr in by_block.items():
+        for i in range(1, len(arr)):
+            fr = arr[i - 1]
+            v = arr[i]
+            if fr.get("direction") != v.get("direction"):
+                continue
+            if v.get("rate1000") is None or fr.get("rate1000") is None:
+                continue
+            if v["direction"] == "TON->USDT" and v["rate1000"] < fr["rate1000"]:
+                pairs.append((bk, fr, v))
+            elif v["direction"] == "USDT->TON" and v["rate1000"] > fr["rate1000"]:
+                pairs.append((bk, fr, v))
+    return pairs
+
+
+def scan_same_block_br(by_block):
+    pairs = []
+    for bk, arr in by_block.items():
+        for i in range(1, len(arr)):
+            v = arr[i - 1]
+            b = arr[i]
+            if v.get("rate1000") is None or b.get("rate1000") is None:
+                continue
+            if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT" and b["rate1000"] > v["rate1000"]:
+                pairs.append((bk, v, b))
+            elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON" and b["rate1000"] < v["rate1000"]:
+                pairs.append((bk, v, b))
+    return pairs
+
+
+def scan_cross_block_br(rows, block_gap):
+    def parse_block_key(bk: str):
+        try:
+            wc, shard, seq = bk.split(":", 2)
+            return int(wc), shard, int(seq)
+        except Exception:
+            return None
+
+    shard_map = {}
+    for r in rows:
+        bk = r.get("block_key")
+        if not bk:
+            continue
+        parsed = parse_block_key(bk)
+        if not parsed:
+            continue
+        wc, shard, seq = parsed
+        shard_map.setdefault((wc, shard), []).append(r)
+
+    cross_pairs = []
+    for (wc, shard), arr in shard_map.items():
+        arr.sort(key=lambda x: (x.get("block_id", {}).get("seqno", 0), x.get("primary_lt", 0)))
+        for i in range(1, len(arr)):
+            v = arr[i - 1]
+            b = arr[i]
+            bk_v = v.get("block_id") or {}
+            bk_b = b.get("block_id") or {}
+            seq_v = bk_v.get("seqno")
+            seq_b = bk_b.get("seqno")
+            if seq_v is None or seq_b is None:
+                continue
+            if seq_b - seq_v == 0:
+                continue  # same-block handled elsewhere
+            if seq_b - seq_v > block_gap:
+                continue
+            if v.get("rate1000") is None or b.get("rate1000") is None:
+                continue
+            if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT" and b["rate1000"] > v["rate1000"]:
+                cross_pairs.append((seq_v, seq_b, v, b))
+            elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON" and b["rate1000"] < v["rate1000"]:
+                cross_pairs.append((seq_v, seq_b, v, b))
+    return cross_pairs
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    out_lines = []
-
-    def emit(msg: str = "") -> None:
-        out_lines.append(msg)
-        print(msg)
+    emitter = Emitter()
+    emit = emitter.emit
 
     rows = load_rows(Path(args.data))
     rows, dropped = sanity_filter(rows)
-    emit(f"Applied sanity filter: kept={len(rows)}, dropped={len(dropped)}")
+    emit("== Load & sanity filter ==")
+    emit(f"kept={len(rows)}, dropped={len(dropped)}")
     if dropped:
         emit("Dropped samples (up to 5):")
         for r, reason in dropped[:5]:
@@ -223,6 +398,10 @@ def main():
         r["primary_lt"] = extract_primary_lt(r) or r.get("lt")
     # fetch block info using notify tx_hash (Jetton Notify)
     if FETCH_BLOCKS:
+        if not args.enable_cross_block_br:
+            emit("(MEV_FETCH_BLOCKS enabled; used for same-block listings)")
+        else:
+            emit("(MEV_FETCH_BLOCKS enabled; same-block + cross-block BR)")
         block_cache = {}
         for r in rows:
             txh = extract_notify_hash(r)
@@ -246,7 +425,7 @@ def main():
     summary = summarize("USDT/TON *1000", scaled_rates)
 
     # Direction-wise summary first
-    emit("=== Direction breakdown: USDT/TON decimal-adjusted (scaled by 1000) ===")
+    emit("\n== Direction breakdown: USDT/TON decimal-adjusted (scaled by 1000) ==")
     for direction, vals in rates_by_dir.items():
         if not vals:
             continue
@@ -254,42 +433,13 @@ def main():
         emit(format_stats(direction, s))
 
     # Overall summary next
-    emit("\n=== USDT/TON decimal-adjusted (scaled by 1000) ===")
+    emit("\n== Overall USDT/TON decimal-adjusted (scaled by 1000) ==")
     for k in ["count", "min", "max", "median", "mean", "stdev"]:
         emit(f"{k}: {summary[k]}")
 
     # min_out vs actual_out comparison
-    coverage = []  # entries with min_out present
-    missing_min_out = 0
-    for r in rows:
-        min_out = extract_min_out(r)
-        out_amt = None
-        try:
-            out_amt = Decimal(r["out_amount"])
-        except Exception:
-            out_amt = None
-
-        if min_out is None or out_amt is None or out_amt == 0:
-            missing_min_out += 1
-            continue
-
-        try:
-            hit_pct = (min_out / out_amt) * 100  # 100% => actual_out == min_out
-        except Exception:
-            hit_pct = None
-
-        coverage.append(
-            {
-                "query_id": r.get("query_id"),
-                "direction": r.get("direction"),
-                "lt": r.get("lt"),
-                "out_amount": out_amt,
-                "min_out": min_out,
-                "hit_pct": float(hit_pct) if hit_pct is not None else None,
-            }
-        )
-
-    emit("\nmin_out coverage (actual_out vs min_out)")
+    coverage, missing_min_out = compute_min_out_coverage(rows)
+    emit("\n== min_out coverage (actual_out vs min_out) ==")
     emit(f"with_min_out: {len(coverage)}, missing_or_invalid: {missing_min_out}")
 
     hit_values = [c["hit_pct"] for c in coverage if c["hit_pct"] is not None]
@@ -300,7 +450,6 @@ def main():
             f"mean={statistics.mean(hit_values):.4f}"
         )
 
-        # Top cases closest to min_out (highest hit_pct)
         emit("\nTop swaps closest to min_out (desc by hit_pct)")
         for d in sorted(coverage, key=lambda x: (x["hit_pct"] is not None, x["hit_pct"]), reverse=True)[:5]:
             if d["hit_pct"] is None:
@@ -311,136 +460,82 @@ def main():
             )
 
     # Same-direction frontrun candidates (victim worse), adjacency-based (previous tx only)
-    fr_pairs = []
-    for i in range(1, len(rows)):
-        fr = rows[i - 1]
-        v = rows[i]
-        if fr.get("direction") != v.get("direction"):
-            continue
-        # victim worse: TON->USDT is worse if rate1000 drops; USDT->TON is worse if rate1000 rises
-        if v["direction"] == "TON->USDT" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
-            if v["rate1000"] < fr["rate1000"]:
-                fr_pairs.append((fr, v))
-        elif v["direction"] == "USDT->TON" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
-            if v["rate1000"] > fr["rate1000"]:
-                fr_pairs.append((fr, v))
-
-    emit("\nSame-direction frontrun candidates (victim worse, adjacent prev tx, block not considered)")
+    fr_pairs = scan_frontrun_adjacent(rows)
+    emit("\n== Adjacent frontrun candidates (no block consideration) ==")
     emit(f"count: {len(fr_pairs)}")
     for fr, v in fr_pairs:
         dt = v.get("utime", 0) - fr.get("utime", 0)
         emit(
-            f"dt={dt}s | FR qid={fr.get('query_id')} utime={fr.get('utime')} lt={fr.get('lt')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
-            f"VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
+            f"dt={dt}s | FR qid={fr.get('query_id')} tx={extract_notify_hash(fr)} utime={fr.get('utime')} lt={fr.get('lt')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
+            f"VICTIM qid={v.get('query_id')} tx={extract_notify_hash(v)} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
         )
 
     # Backrun candidates (victim then opposite-direction tx that benefits from victim move)
-    backrun_pairs = []
-    for i in range(1, len(rows)):
-        v = rows[i - 1]
-        b = rows[i]
-        if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT":
-            if v.get("rate1000") is not None and b.get("rate1000") is not None:
-                # victim buys (price up), backrun sells at higher price => backrun rate higher
-                if b["rate1000"] > v["rate1000"]:
-                    backrun_pairs.append((v, b))
-        elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON":
-            if v.get("rate1000") is not None and b.get("rate1000") is not None:
-                # victim sells (price down), backrun buys cheaper => backrun rate lower
-                if b["rate1000"] < v["rate1000"]:
-                    backrun_pairs.append((v, b))
-
-    emit("\nBackrun candidates (victim then opposite-direction tx that benefits from victim move)")
+    backrun_pairs = scan_backrun_adjacent(rows)
+    emit("\n== Adjacent backrun candidates (no block consideration) ==")
     emit(f"count: {len(backrun_pairs)}")
     for v, b in backrun_pairs:
         dt = b.get("utime", 0) - v.get("utime", 0)
         emit(
-            f"dt={dt}s | VICTIM qid={v.get('query_id')} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
-            f"BACKRUN qid={b.get('query_id')} utime={b.get('utime')} lt={b.get('lt')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
+            f"dt={dt}s | VICTIM qid={v.get('query_id')} tx={extract_notify_hash(v)} utime={v.get('utime')} lt={v.get('lt')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
+            f"BACKRUN qid={b.get('query_id')} tx={extract_notify_hash(b)} utime={b.get('utime')} lt={b.get('lt')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
         )
 
     # Same-block (notify-based block_key) frontrun candidates using primary_lt order
-    emit("\nSame-block frontrun scan (notify block, primary_lt order, victim worse; block considered)")
-    emit("Listing blocks with >=2 swaps (not necessarily FR):")
+    emit("\n== Same-block frontrun scan (notify block, primary_lt order) ==")
     if FETCH_BLOCKS:
-        same_block_pairs = []
-        by_block = {}
-        for r in rows:
-            bk = r.get("block_key")
-            if not bk:
-                continue
-            by_block.setdefault(bk, []).append(r)
-
-        # debug: show block composition
+        by_block = build_block_index(rows)
         emit(f"blocks_with_tx: {len(by_block)}")
         multi = {bk: arr for bk, arr in by_block.items() if len(arr) > 1}
         emit(f"blocks_with_multiple_tx (shown below): {len(multi)}")
         for bk, arr in sorted(multi.items(), key=lambda x: x[0])[:20]:
-            arr_sorted = sorted(arr, key=lambda x: x.get("primary_lt", 0))
             emit(
-                f"block={bk} count={len(arr_sorted)} qids={[a.get('query_id') for a in arr_sorted]} "
-                f"primary_lt={[a.get('primary_lt') for a in arr_sorted]} dirs={[a.get('direction') for a in arr_sorted]}"
+                f"block={bk} count={len(arr)} qids={[a.get('query_id') for a in arr]} "
+                f"primary_lt={[a.get('primary_lt') for a in arr]} dirs={[a.get('direction') for a in arr]}"
             )
-        for bk, arr in by_block.items():
-            arr.sort(key=lambda x: x.get("primary_lt", 0))
-            for i in range(1, len(arr)):
-                fr = arr[i - 1]
-                v = arr[i]
-                if fr.get("direction") != v.get("direction"):
-                    continue
-                if v["direction"] == "TON->USDT" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
-                    if v["rate1000"] < fr["rate1000"]:
-                        same_block_pairs.append((bk, fr, v))
-                elif v["direction"] == "USDT->TON" and v.get("rate1000") is not None and fr.get("rate1000") is not None:
-                    if v["rate1000"] > fr["rate1000"]:
-                        same_block_pairs.append((bk, fr, v))
 
-        emit(f"Same-block FR candidates (same direction, victim rate worse): count={len(same_block_pairs)}")
+        same_block_pairs = scan_same_block_fr(by_block)
+        emit(f"Same-block FR candidates: count={len(same_block_pairs)}")
         for bk, fr, v in same_block_pairs:
             dt = v.get("utime", 0) - fr.get("utime", 0)
             emit(
-                f"block={bk} | dt={dt}s | FR qid={fr.get('query_id')} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
-                f"VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
+                f"block={bk} | dt={dt}s | FR qid={fr.get('query_id')} tx={extract_notify_hash(fr)} primary_lt={fr.get('primary_lt')} dir={fr.get('direction')} rate1000={float(fr.get('rate1000')):.4f} | "
+                f"VICTIM qid={v.get('query_id')} tx={extract_notify_hash(v)} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f}"
             )
     else:
         emit("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
 
     # Same-block backrun candidates (opposite direction, backrunner benefits)
-    emit("\nSame-block backrun scan (notify block, primary_lt order, backrunner benefits; block considered)")
+    emit("\n== Same-block backrun scan (notify block, primary_lt order) ==")
     if FETCH_BLOCKS:
-        back_block_pairs = []
-        by_block = {}
-        for r in rows:
-            bk = r.get("block_key")
-            if not bk:
-                continue
-            by_block.setdefault(bk, []).append(r)
-        for bk, arr in by_block.items():
-            arr.sort(key=lambda x: x.get("primary_lt", 0))
-            for i in range(1, len(arr)):
-                v = arr[i - 1]
-                b = arr[i]
-                if v.get("direction") == "USDT->TON" and b.get("direction") == "TON->USDT":
-                    if v.get("rate1000") is not None and b.get("rate1000") is not None and b["rate1000"] > v["rate1000"]:
-                        back_block_pairs.append((bk, v, b))
-                elif v.get("direction") == "TON->USDT" and b.get("direction") == "USDT->TON":
-                    if v.get("rate1000") is not None and b.get("rate1000") is not None and b["rate1000"] < v["rate1000"]:
-                        back_block_pairs.append((bk, v, b))
-        emit(f"Same-block BR candidates (opposite direction, backrunner benefits): count={len(back_block_pairs)}")
+        back_block_pairs = scan_same_block_br(by_block)
+        emit(f"Same-block BR candidates: count={len(back_block_pairs)}")
         for bk, v, b in back_block_pairs:
             dt = b.get("utime", 0) - v.get("utime", 0)
             emit(
-                f"block={bk} | dt={dt}s | VICTIM qid={v.get('query_id')} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
-                f"BACKRUN qid={b.get('query_id')} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
+                f"block={bk} | dt={dt}s | VICTIM qid={v.get('query_id')} tx={extract_notify_hash(v)} primary_lt={v.get('primary_lt')} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
+                f"BACKRUN qid={b.get('query_id')} tx={extract_notify_hash(b)} primary_lt={b.get('primary_lt')} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
             )
+
+        # Cross-block backrun scan (adjacent blocks within gap on same shard)
+        if args.enable_cross_block_br:
+            emit(
+                f"\n== Cross-block backrun scan (0 < block gap <= {args.block_gap}, same shard) =="
+            )
+            cross_pairs = scan_cross_block_br(rows, args.block_gap)
+            emit(f"Cross-block BR candidates (0 < block gap <= {args.block_gap}): count={len(cross_pairs)}")
+            for seq_v, seq_b, v, b in cross_pairs:
+                dt = b.get("utime", 0) - v.get("utime", 0)
+                emit(
+                    f"shard={v.get('block_key')} seq_gap={seq_b-seq_v} | dt={dt}s | VICTIM qid={v.get('query_id')} tx={extract_notify_hash(v)} seq={seq_v} dir={v.get('direction')} rate1000={float(v.get('rate1000')):.4f} | "
+                    f"BACKRUN qid={b.get('query_id')} tx={extract_notify_hash(b)} seq={seq_b} dir={b.get('direction')} rate1000={float(b.get('rate1000')):.4f}"
+                )
+        else:
+            emit("(cross-block backrun scan disabled; use --enable-cross-block-br to enable)")
     else:
         emit("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
 
-    if args.out:
-        out_path = Path(args.out)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text("\n".join(out_lines), encoding="utf-8")
-        emit(f"\nSaved summary to {out_path}")
+    emitter.save(Path(args.out) if args.out else None)
 
 
 if __name__ == "__main__":

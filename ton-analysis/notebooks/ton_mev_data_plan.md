@@ -25,14 +25,15 @@
 
 ### TONにおけるMEV手段の前提
 - **ガス入札競争（GPA）**: 事実上なし。ガスを積んで順番を奪う手段は使えない。
-- **到達競争（低レイテンシ/特定ピア経由）**: 可能。提案者が「先に受信したTXを優先」するなら、早押しで前に入れる余地がある。
-- **提案者による並べ替え**: 可能。提案者はブロック内の順序を決める裁量があり、自身のTXや任意の順を先頭に置ける（有効性・ブロック制約を満たす範囲で）。
+- **到達競争（低レイテンシ/特定ピア経由）**: シャード割り当てが送信者に選べないため、同一シャードに載るかは運要素が大きい。偶然同じシャードに載った場合のみ「先に受信したTXを優先」するポリシーなら効果がありうるが、狙撃性は低い。
+- **提案者による並べ替え**: 可能。提案者はブロック内の順序を決める裁量があり、自身のTXや任意の順を先頭に置ける（有効性・ブロック制約を満たす範囲で）。同一シャードのブロックビルダーであることがFR/BR実行の現実的前提。
 
 #### チェーン別ざっくり比較
 - **Ethereum**: GPAあり（tip競争）。到達競争あり。提案者/ビルダー並べ替え余地あり（MEV-Boost/PBS系）。
 - **Solana**: 優先手数料で実質GPA的競争あり。到達競争あり。リーダー裁量で並べ替え余地あり。
-- **TON**: GPAなし。到達競争あり。提案者裁量で並べ替え余地あり。
-  - シャーディング構造: シャードごとにブロックを生成し、マスターチェーンが「正しい最新シャードブロック」への参照をBFTで合意する。シャード内Tx順序は提案者裁量（lt昇順で適用）、マスターチェーン側で参照順をいじってもTx順序や価格インパクトはほぼ変わらない。
+- **TON**: GPAなし。到達競争は「たまたま同じシャードに載った場合」に限定的に効くが、送信者はシャードを選べず狙撃性は低い。並べ替え余地はシャード提案者（ビルダー）の裁量が大きい。
+  - シャーディング構造: シャードごとにブロックを生成し、マスターチェーンが各シャードの最新ブロック参照をBFTで合意する。Tx順序は各シャード内で提案者が決める（lt昇順で適用）ため、同一シャードかつ提案者権限がFR/BR成立の前提。マスターチェーンで参照順をいじってもシャード内の順序や価格インパクトはほぼ変わらない。
+  - MEV有効範囲の目安（同一シャード前提）: gap=0（同一ブロック）が最大。gap=1（次ブロック）までは価格インパクトが残りうるが、gap≥2は希薄化しやすい。別シャードに載るTxは価格インパクトをほぼ踏めない。
 
 ## 範囲
 - 期間: 直近24時間に限定。
@@ -65,13 +66,20 @@
 #### スクリプト整理
 - `scripts/fetch_swaps.py`: 本番用。query_id で Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/swaps_24h.ndjson`。ページングなしの単発取得（limit 指定のみ）。direction が `unknown` の行は除外。
 - `scripts/debug_extract_opcodes.py`: デバッグ用の軽量版。動作・出力フォーマットは fetch_swaps.py と同等（direction/in/out/rate 含む）が、用途は調査・比較に限定。
-- `scripts/mev_rate_check.py`: レート統一（USDT/TON decimal-adjusted, scaled by 1000）と min_out 対比の余裕度を確認する集計スクリプト。
+- `scripts/mev_rate_check.py`: レート統一（USDT/TON decimal-adjusted, scaled by 1000）、min_out 対比、FR/BR検知（同一ブロック・隣接・クロスブロック）を行う集計スクリプト。
   - レート統一: TON->USDT は 1/rate、USDT->TON は rate、その後1000倍スケール。
+  - 主なオプション:
+    - `--data <path>`: 入力NDJSON（デフォルト: data/swaps_sample.ndjson）
+    - `--out <path>`: サマリをファイル保存
+    - `--enable-cross-block-br`: ブロック差をまたぐBRスキャンを有効化（MEV_FETCH_BLOCKS=trueが必要）
+    - `--block-gap <n>`: クロスブロックBRの最大seq差（同ブロック=0は除外、デフォルト1）
   - 使い方例:
     - 直近10〜30分を取得: `python ton-analysis/scripts/fetch_swaps.py --max-age-mins 30 --limit 30 --pages 10 --out ton-analysis/data/swaps_latest.ndjson`
-    - ブロック情報を付けて解析（同一ブロックFR/バックランを判定）:
-      `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_latest.ndjson`
-    - ブロック取得なしで軽量解析:
+    - 同一ブロックのみのFR/BR解析（クロスBRなし）:
+      `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_24h.ndjson --out ton-analysis/data/mev_rate_summary.txt`
+    - 同一ブロック＋クロスブロックBR（seq差<=1、同ブロック=0は除外）:
+      `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_24h.ndjson --out ton-analysis/data/mev_rate_summary.txt --enable-cross-block-br --block-gap=1`
+    - ブロック取得なしで軽量解析（FR/BR=ブロック無視の隣接のみ）:
       `MEV_FETCH_BLOCKS=false python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_latest.ndjson`
     - fetch_swapsは `NEXT_PUBLIC_TON_API_BASE_URL` / `TON_ROUTER` / `NEXT_PUBLIC_TON_API_KEY` 等を環境変数で上書き可能。mev_rate_checkは `MEV_FETCH_BLOCKS` でブロック取得のオン/オフを制御。
   - min_out 抽出: `swap.out_msg.decoded_body.dex_payload.swap_body.min_out` または `notify.in_msg.decoded_body.forward_payload.value.value.cross_swap_body.min_out`。
