@@ -64,39 +64,21 @@
 - 24h分を `before_lt` でページングしてNDJSONに保存し、後段のノートで集計・検知に用いる。
 
 #### スクリプト整理
-- `scripts/fetch_swaps.py`: 本番用。query_id で Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/swaps_24h.ndjson`。ページングなしの単発取得（limit 指定のみ）。direction が `unknown` の行は除外。
-- `scripts/debug_extract_opcodes.py`: デバッグ用の軽量版。動作・出力フォーマットは fetch_swaps.py と同等（direction/in/out/rate 含む）が、用途は調査・比較に限定。
-- `scripts/mev_rate_check.py`: レート統一（USDT/TON decimal-adjusted, scaled by 1000）、min_out 対比、FR/BR検知（同一ブロック・隣接・クロスブロック）を行う集計スクリプト。
-  - レート統一: TON->USDT は 1/rate、USDT->TON は rate、その後1000倍スケール。
-  - 主なオプション:
-    - `--data <path>`: 入力NDJSON（デフォルト: data/swaps_sample.ndjson）
-    - `--out <path>`: サマリをファイル保存
-    - `--enable-cross-block-br`: ブロック差をまたぐBRスキャンを有効化（MEV_FETCH_BLOCKS=trueが必要）
-    - `--block-gap <n>`: クロスブロックBRの最大seq差（同ブロック=0は除外、デフォルト1）
-  - 使い方例:
-    - 直近10〜30分を取得: `python ton-analysis/scripts/fetch_swaps.py --max-age-mins 30 --limit 30 --pages 10 --out ton-analysis/data/swaps_latest.ndjson`
-    - 同一ブロックのみのFR/BR解析（クロスBRなし）:
-      `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_24h.ndjson --out ton-analysis/data/mev_rate_summary.txt`
-    - 同一ブロック＋クロスブロックBR（seq差<=1、同ブロック=0は除外）:
-      `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_24h.ndjson --out ton-analysis/data/mev_rate_summary.txt --enable-cross-block-br --block-gap=1`
-    - ブロック取得なしで軽量解析（FR/BR=ブロック無視の隣接のみ）:
-      `MEV_FETCH_BLOCKS=false python ton-analysis/scripts/mev_rate_check.py --data ton-analysis/data/swaps_latest.ndjson`
+- フェッチ系
+  - `scripts/stonfi_fetch_swaps.py`: STONFi v2向け。query_id で Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/stonfi_swaps_latest.ndjson`。direction が `unknown` は除外。
+  - `scripts/dudust_fetch_swaps.py`: DeDust Classic向け。同様に query_id で束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/dudust_swaps_latest.ndjson`。direction が `unknown` は除外。
+- 解析系
+  - `scripts/swap_mev_detector.py`: レート統一（USDT/TON decimal-adjusted, scaled by 1000）、min_out 対比、FR/BR検知（同一ブロック・隣接・クロスブロック）を行う集計スクリプト。
+    - レート統一: TON->USDT は 1/rate、USDT->TON は rate、その後1000倍スケール。
+    - 主なオプション: `--data`, `--out`, `--enable-cross-block-br`, `--block-gap <n>`（デフォルト1）
+    - Stonfi例: `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/swap_mev_detector.py --data ton-analysis/data/stonfi_swaps_latest.ndjson --out ton-analysis/data/stonfi_mev_summary_gap1.txt --enable-cross-block-br --block-gap=1`
+    - DuDust例: `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/swap_mev_detector.py --data ton-analysis/data/dudust_swaps_latest.ndjson --out ton-analysis/data/dudust_mev_summary_gap1.txt --enable-cross-block-br --block-gap=1`
     - fetch_swapsは `NEXT_PUBLIC_TON_API_BASE_URL` / `TON_ROUTER` / `NEXT_PUBLIC_TON_API_KEY` 等を環境変数で上書き可能。mev_rate_checkは `MEV_FETCH_BLOCKS` でブロック取得のオン/オフを制御。
   - min_out 抽出: `swap.out_msg.decoded_body.dex_payload.swap_body.min_out` または `notify.in_msg.decoded_body.forward_payload.value.value.cross_swap_body.min_out`。
   - hit_pct = (min_out / actual_out) * 100（100%なら実受取がmin_outちょうど）。hit_pctが高いほど許容下限ギリギリ。
   - 現行サンプル: min_out 欠損なし（with_min_out=31, missing=0）、例: hit_pct max ≈99.97%, median=99.00%, mean≈95.48%。
   - 留意: hit_pctはユーザー設定の許容幅に依存。見積価格が無いため被害額は前後Txや外部価格を用いて評価する必要あり。
 
-#### tonapiレスポンスで確認できた項目（サンプル取得より）
-- トップレベル: `hash`, `lt`, `utime`, `block`, `total_fees`
-- in_msg: `op_code` (Jetton Notify), `source/destination`, `value`, `decoded_body.query_id/amount/sender/forward_payload (StonfiSwapV2, min_out, receiver など)`
-- out_msgs: `op_code` (Jetton Transfer), `decoded_body.query_id/amount/destination/response_destination`
-- DEX固有: `decoded_op_name` (stonfi_swap_v2, stonfi_pay_to_v2 など) と `additional_info` / `dex_payload` に `token_wallet1`, `amount0_out/amount1_out`
-- 提案者/validator情報はレスポンスに見当たらず（要別途手段）。
-
-## 理由（この粒度で始めるワケ）
-- 初回から広げるとデータ量・実装コストが膨らむため、1ペア・24hで有害MEVの兆候をまず確認する。
-- 問題が見えたら他ペアや期間、ブリッジ経路に拡張する。
 
 ## 次のステップ案
 - スワップログ取得スクリプト雛形を作成し、24hデータをpull。

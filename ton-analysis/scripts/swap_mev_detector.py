@@ -15,6 +15,14 @@ TON_API_BASE = os.getenv("TON_API_BASE_URL") or os.getenv("NEXT_PUBLIC_TON_API_B
 FETCH_BLOCKS = (os.getenv("MEV_FETCH_BLOCKS") or "true").lower() in ("1", "true", "yes", "on")
 
 
+def derive_out_path(data_path: Path, enable_cross_block_br: bool, block_gap: int) -> Path:
+    stem = data_path.stem
+    base = f"{stem}_mev_summary"
+    if enable_cross_block_br:
+        base += f"_gap{block_gap}"
+    return data_path.parent / f"{base}.txt"
+
+
 def load_rows(path: Path):
     with path.open() as f:
         return [json.loads(line) for line in f]
@@ -126,18 +134,13 @@ def sanity_filter(rows):
     filtered = []
     dropped = []
     for r in rows:
-        try:
-            rate = Decimal(r["rate"])
-        except Exception:
-            dropped.append((r, "rate_parse_error"))
-            continue
-
+        rate = Decimal(r["rate"])
         if r.get("direction") == "USDT->TON":
-            if rate <= Decimal("1e-6") or rate >= Decimal("0.01"):
+            if rate <= Decimal("0") or rate >= Decimal("1000000"):
                 dropped.append((r, "usdt_ton_sanity"))
                 continue
         elif r.get("direction") == "TON->USDT":
-            if rate <= Decimal("10") or rate >= Decimal("5000"):
+            if rate <= Decimal("0") or rate >= Decimal("1000"):
                 dropped.append((r, "ton_usdt_sanity"))
                 continue
         filtered.append(r)
@@ -383,7 +386,8 @@ def main():
     emitter = Emitter()
     emit = emitter.emit
 
-    rows = load_rows(Path(args.data))
+    data_path = Path(args.data)
+    rows = load_rows(data_path)
     rows, dropped = sanity_filter(rows)
     emit("== Load & sanity filter ==")
     emit(f"kept={len(rows)}, dropped={len(dropped)}")
@@ -535,7 +539,8 @@ def main():
     else:
         emit("(block fetch disabled; set MEV_FETCH_BLOCKS=true to enable)")
 
-    emitter.save(Path(args.out) if args.out else None)
+    out_path = Path(args.out) if args.out else derive_out_path(data_path, args.enable_cross_block_br, args.block_gap)
+    emitter.save(out_path)
 
 
 if __name__ == "__main__":

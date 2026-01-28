@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-DEFAULT_OUT = "ton-analysis/data/swaps_24h.ndjson"
+DEFAULT_OUT = "ton-analysis/data/stonfi_swaps_latest.ndjson"
 TON_ROUTER = "EQCS4UEa5UaJLzOyyKieqQOQ2P9M-7kXpkO5HnP3Bv250cN3"
 
 # precision for rate

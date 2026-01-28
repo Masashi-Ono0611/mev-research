@@ -2,5 +2,4 @@ papers/raw/
 ton-analysis/sc.ruff_cache
 .python-version
 .venv
-ton-analysis/data/
 ton-analysis/scripts/.env
