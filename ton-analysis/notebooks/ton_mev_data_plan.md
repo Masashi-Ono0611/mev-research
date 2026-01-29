@@ -65,14 +65,16 @@
 
 #### スクリプト整理
 - フェッチ系
-  - `scripts/stonfi_fetch_swaps.py`: STONFi v2向け。query_id で Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/stonfi_swaps_latest.ndjson`。direction が `unknown` は除外。
-  - `scripts/dudust_fetch_swaps.py`: DeDust Classic向け。同様に query_id で束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/dudust_swaps_latest.ndjson`。direction が `unknown` は除外。
+  - `scripts/stonfi_fetch_swaps.py`: STONFi v2向け。query_id で Jetton Notify / SwapV2 / PayToV2 / Jetton Transfer を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/stonfi_swaps_latest.ndjson`。direction が `unknown` は除外。`--sleep-secs` でページング間にスリープを入れられる。
+  - `scripts/dudust_fetch_swaps.py`: DeDust Classic向け。同様に query_id で束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/dudust_swaps_latest.ndjson`。direction が `unknown` は除外。`--sleep-secs` あり。
+  - `scripts/tonco_fetch_swaps.py`: TONCO Poolv3向け。Poolv3 Swap / Pay To を束ね、direction/in/out/rate/lt/utime を付けて NDJSON 出力。デフォルト出力先 `ton-analysis/data/tonco_swaps_latest.ndjson`。direction が `unknown` は除外。`--sleep-secs` あり。
 - 解析系
   - `scripts/swap_mev_detector.py`: レート統一（USDT/TON decimal-adjusted, scaled by 1000）、min_out 対比、FR/BR検知（同一ブロック・隣接・クロスブロック）を行う集計スクリプト。
     - レート統一: TON->USDT は 1/rate、USDT->TON は rate、その後1000倍スケール。
     - 主なオプション: `--data`, `--out`, `--enable-cross-block-br`, `--block-gap <n>`（デフォルト1）
     - Stonfi例: `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/swap_mev_detector.py --data ton-analysis/data/stonfi_swaps_latest.ndjson --out ton-analysis/data/stonfi_mev_summary_gap1.txt --enable-cross-block-br --block-gap=1`
     - DuDust例: `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/swap_mev_detector.py --data ton-analysis/data/dudust_swaps_latest.ndjson --out ton-analysis/data/dudust_mev_summary_gap1.txt --enable-cross-block-br --block-gap=1`
+    - TONCO例: `MEV_FETCH_BLOCKS=true python ton-analysis/scripts/swap_mev_detector.py --data ton-analysis/data/tonco_swaps_latest.ndjson --out ton-analysis/data/tonco_mev_summary_gap1.txt --enable-cross-block-br --block-gap=1`
     - fetch_swapsは `NEXT_PUBLIC_TON_API_BASE_URL` / `TON_ROUTER` / `NEXT_PUBLIC_TON_API_KEY` 等を環境変数で上書き可能。mev_rate_checkは `MEV_FETCH_BLOCKS` でブロック取得のオン/オフを制御。
   - min_out 抽出: `swap.out_msg.decoded_body.dex_payload.swap_body.min_out` または `notify.in_msg.decoded_body.forward_payload.value.value.cross_swap_body.min_out`。
   - hit_pct = (min_out / actual_out) * 100（100%なら実受取がmin_outちょうど）。hit_pctが高いほど許容下限ギリギリ。
@@ -84,6 +86,6 @@
 - 仮想環境: `.venv` を使用（`source .venv/bin/activate`）
 
 ## 次のステップ案
-- スワップログ取得スクリプト雛形を作成し、24hデータをpull。
+- スワップログ取得スクリプト雛形を作成し、24hデータをpull（必要に応じ `--sleep-secs` でレート制限回避）。
 - サンドイッチ簡易検知とスリッページ分布を算出。
 - ブロックメタと突合し、遅延・集中度をざっくり算出し可視化。

@@ -28,8 +28,16 @@ def load_rows(path: Path):
 
 
 def extract_primary_lt(row: dict) -> Optional[int]:
-    """Prefer notify.in_msg.created_lt (Jetton Notify), fallback to others."""
-    # primary choice: Jetton Notify in_msg
+    """Prefer swap.in_msg.created_lt (TONCO), fallback to notify.in_msg.created_lt (Jetton Notify), then others."""
+    # TONCO: swap.in_msg.created_lt
+    try:
+        swap_lt = int((((row.get("swap") or {}).get("in_msg") or {}).get("created_lt")) or 0)
+        if swap_lt:
+            return swap_lt
+    except Exception:
+        pass
+
+    # Jetton Notify: notify.in_msg.created_lt
     notify_lt = None
     try:
         notify_lt = int((((row.get("notify") or {}).get("in_msg") or {}).get("created_lt")) or 0)
@@ -59,6 +67,12 @@ def extract_primary_lt(row: dict) -> Optional[int]:
 
 
 def extract_notify_hash(row: dict) -> Optional[str]:
+    """Prefer swap.tx_hash (TONCO), fallback to notify.tx_hash (Jetton Notify)."""
+    # TONCO: swap.tx_hash
+    swap_hash = ((row.get("swap") or {}).get("tx_hash")) or None
+    if swap_hash:
+        return swap_hash
+    # Jetton Notify: notify.tx_hash
     return ((row.get("notify") or {}).get("tx_hash")) or None
 
 

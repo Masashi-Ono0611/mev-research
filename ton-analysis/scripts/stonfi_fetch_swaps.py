@@ -55,6 +55,7 @@ def fetch_pages(
     api_key: Optional[str],
     before_lt: Optional[int],
     cutoff_utime: Optional[int],
+    sleep_secs: float = 0.0,
 ) -> List[Dict[str, Any]]:
     all_txs: List[Dict[str, Any]] = []
     cursor = before_lt
@@ -77,6 +78,8 @@ def fetch_pages(
         except ValueError:
             break
         cursor = min_lt - 1
+        if sleep_secs > 0:
+            time.sleep(sleep_secs)
     return all_txs
 
 
@@ -277,6 +280,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--pages", type=int, default=20, help="How many pages to fetch (pagination backward by lt)")
     parser.add_argument("--before-lt", type=int, default=None, help="Optional before_lt for pagination anchor")
     parser.add_argument("--max-age-mins", type=int, default=None, help="Stop when tx utime older than now - max_age_min")
+    parser.add_argument("--sleep-secs", type=float, default=0.0, help="Optional sleep seconds between page fetches")
     parser.add_argument("--out", default=DEFAULT_OUT, help="NDJSON output path")
     parser.add_argument("--raw-out", default=DEFAULT_RAW_OUT, help="Optional: save raw tonapi txs to NDJSON")
     parser.add_argument(
@@ -298,6 +302,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         api_key=args.api_key,
         before_lt=args.before_lt,
         cutoff_utime=cutoff_utime,
+        sleep_secs=args.sleep_secs,
     )
 
     # Save raw tonapi transactions if requested
