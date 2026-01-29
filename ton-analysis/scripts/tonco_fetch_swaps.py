@@ -1,9 +1,3 @@
-"""
-DeDust Classic swap fetcher via tonapi.io (bundled by query_id).
-- Paging with limit (default 50) is supported; use --pages / --before-lt.
-- Mergesort Notify / Swap / PayTo / PayoutFromPool are bundled by query_id with direction/in/out/rate to NDJSON.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -12,33 +6,32 @@ import os
 import sys
 import time
 from decimal import Decimal, InvalidOperation, getcontext
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-DEFAULT_OUT = "ton-analysis/data/dudust_swaps_latest.ndjson"
-DEFAULT_RAW_OUT = "ton-analysis/data/dudust_swaps_tonapi_raw.ndjson"
-DEDUST_TON_USDT_POOL_ADDR = "EQA-X_yo3fzzbDbJ_0bzFWKqtRuZFIRa1sJsveZJ1YpViO3r"
+DEFAULT_OUT = "ton-analysis/data/tonco_swaps_latest.ndjson"
+DEFAULT_RAW_OUT = "ton-analysis/data/tonco_swaps_tonapi_raw.ndjson"
+
+TONCO_TON_USDT_POOL_ADDR = "EQD25vStEwc-h1QT1qlsYPQwqU5IiOhox5II0C_xsDNpMVo7"
+
+IN_OP_POOLV3_SWAP = "0xa7fb58f8"
+OUT_OP_PAY_TO = "0xa1daa96d"
+
+TONCO_TON_WALLET_ADDR = "0:871da9215b14902166f0ea2a16db56278d528108377f8158c5f4ccfdfdd22e17"
+TONCO_USDT_WALLET_ADDR = "0:acad45796724b3f00ad42a4311b20667da4be28a43951587a381f73aa9552209"
 
 getcontext().prec = 28
 
-IN_OP_SWAP_EXTERNAL = "0x61ee542d"
-OUT_OP_PAYOUT_FROM_POOL = "0xad4eb6f5"
-OUT_OP_DEDUST_SWAP = "0x9c610de3"
 
-# Wallets to decide direction (addresses observed in tonapi responses)
-MERGESORT_ADDR = "0:dae153a74d894bbc32748198cd626e4f5df4a69ad2fa56ce80fc2644b5708d20"
-DEDUST_USDT_VAULT_ADDR = "0:18aa8e2eed51747dae033c079b93883d941cad8f65459f2ee9cd7474b6b8ed5d"
-
-
-def fetch_page(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
+def fetch_page(api_url: str, pool: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {"limit": limit}
     if before_lt:
         params["before_lt"] = before_lt
     headers: Dict[str, str] = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    url = f"{api_url.rstrip('/')}/accounts/{router}/transactions"
+    url = f"{api_url.rstrip('/')}/accounts/{pool}/transactions"
     resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json().get("transactions", [])
@@ -46,7 +39,7 @@ def fetch_page(api_url: str, router: str, limit: int, api_key: Optional[str], be
 
 def fetch_pages(
     api_url: str,
-    router: str,
+    pool: str,
     limit: int,
     pages: int,
     api_key: Optional[str],
@@ -56,7 +49,7 @@ def fetch_pages(
     all_txs: List[Dict[str, Any]] = []
     cursor = before_lt
     for _ in range(max(1, pages)):
-        txs = fetch_page(api_url, router, limit, api_key, cursor)
+        txs = fetch_page(api_url, pool, limit, api_key, cursor)
         if not txs:
             break
         all_txs.extend(txs)
@@ -68,7 +61,6 @@ def fetch_pages(
                 pass
         if len(txs) < limit:
             break
-        # advance cursor to fetch older txs
         try:
             min_lt = min(int(t.get("lt", 0)) for t in txs if t.get("lt") is not None)
         except ValueError:
@@ -81,41 +73,85 @@ def infer_direction(parts: Dict[str, Any]) -> str:
     def norm(addr: str) -> str:
         return (addr or "").lower()
 
-    notify = parts.get("notify") or {}
-    n_src = norm(((notify.get("in_msg") or {}).get("source") or {}).get("address", ""))
+    swap = (parts.get("swap") or {}).get("in_msg") or {}
+    src_wallet = norm(((swap.get("decoded_body") or {}).get("source_wallet") or ""))
 
-    transfer = parts.get("transfer") or {}
-    t_dest = norm(((transfer.get("out_msg") or {}).get("destination") or {}).get("address", ""))
-
-    if n_src == norm(MERGESORT_ADDR) and t_dest == norm(DEDUST_USDT_VAULT_ADDR):
+    if src_wallet == norm(TONCO_TON_WALLET_ADDR):
         return "TON->USDT"
-    if n_src == norm(DEDUST_USDT_VAULT_ADDR) and t_dest == norm(MERGESORT_ADDR):
+    if src_wallet == norm(TONCO_USDT_WALLET_ADDR):
         return "USDT->TON"
 
     return "unknown"
 
 
 def extract_meta(parts: Dict[str, Any]) -> Dict[str, Any]:
-    notify = parts.get("notify") or {}
-
-    in_msg = (notify.get("in_msg") or {}) if notify else {}
-    lt = (in_msg.get("created_lt"))
-    utime = (in_msg.get("created_at"))
+    swap = (parts.get("swap") or {}).get("in_msg") or {}
+    lt = swap.get("created_lt")
+    utime = swap.get("created_at")
     return {"lt": lt, "utime": utime}
 
 
+def _decimal(val: Any) -> Optional[Decimal]:
+    try:
+        return Decimal(str(val))
+    except (InvalidOperation, TypeError):
+        return None
+
+
+def _normalize_addr(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return val.get("address") or val.get("addr") or val.get("value")
+    return str(val)
+
+
+def _extract_pay_to_amounts(pay_to_decoded: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
+    pay_to = pay_to_decoded.get("pay_to") or {}
+    code200 = (pay_to.get("pay_to_code200") or {})
+    coins = (code200.get("coinsinfo_cell") or {})
+
+    amount0 = coins.get("amount0")
+    jetton0 = _normalize_addr(coins.get("jetton0_address"))
+    amount1 = coins.get("amount1")
+    jetton1 = _normalize_addr(coins.get("jetton1_address"))
+
+    if amount0 is None or amount1 is None or jetton0 is None or jetton1 is None:
+        return None
+
+    return str(amount0), str(jetton0), str(amount1), str(jetton1)
+
+
 def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
-    def d(val: Any) -> Optional[Decimal]:
-        try:
-            return Decimal(str(val))
-        except (InvalidOperation, TypeError):
-            return None
+    swap = (parts.get("swap") or {}).get("in_msg") or {}
+    pay = (parts.get("pay") or {}).get("out_msg") or {}
 
-    notify = (parts.get("notify") or {}).get("in_msg") or {}
-    transfer = (parts.get("transfer") or {}).get("out_msg") or {}
+    swap_decoded = swap.get("decoded_body") or {}
+    in_amt = _decimal(((swap_decoded.get("params_cell") or {}).get("amount")))
 
-    in_amt = d(((notify.get("decoded_body") or {}).get("amount")))
-    out_amt = d(((transfer.get("decoded_body") or {}).get("amount")))
+    out_amt: Optional[Decimal] = None
+    pay_decoded = pay.get("decoded_body") or {}
+    pay_amounts = _extract_pay_to_amounts(pay_decoded) if pay_decoded else None
+
+    if pay_amounts:
+        amount0, jetton0, amount1, jetton1 = pay_amounts
+        src_wallet = str((swap_decoded.get("source_wallet") or "")).lower()
+        candidates = [
+            (amount0, str(jetton0).lower()),
+            (amount1, str(jetton1).lower()),
+        ]
+
+        non_zero = [(a, j) for a, j in candidates if str(a) not in ("0", "0.0", "")]
+        if len(non_zero) == 1:
+            out_amt = _decimal(non_zero[0][0])
+        else:
+            out_by_jetton = [(a, j) for a, j in candidates if j != src_wallet and str(a) not in ("0", "0.0", "")]
+            if out_by_jetton:
+                out_amt = _decimal(out_by_jetton[0][0])
+            elif direction == "USDT->TON":
+                out_amt = _decimal(amount0)
+            elif direction == "TON->USDT":
+                out_amt = _decimal(amount1)
 
     rate = None
     if in_amt and out_amt and in_amt != 0:
@@ -131,7 +167,7 @@ def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
     }
 
 
-def is_successful_swap(parts: Dict[str, Any], direction: str, amounts: Dict[str, Any]) -> bool:
+def is_successful_swap(direction: str, amounts: Dict[str, Any]) -> bool:
     out_amt_str = amounts.get("out_amount")
     in_amt_str = amounts.get("in_amount")
     if out_amt_str in (None, "0"):
@@ -143,36 +179,35 @@ def is_successful_swap(parts: Dict[str, Any], direction: str, amounts: Dict[str,
 
 def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = {}
+
     for tx in txs:
         in_msg = tx.get("in_msg") or {}
         out_msgs = tx.get("out_msgs") or []
 
-        in_op = (in_msg.get("op_code", "") or "").lower()
-        role = None
         qid = None
-        if in_op == IN_OP_SWAP_EXTERNAL:
+        in_op = (in_msg.get("op_code", "") or "").lower()
+        if in_op == IN_OP_POOLV3_SWAP:
             qid = str((in_msg.get("decoded_body") or {}).get("query_id", ""))
-            role = "notify"
+
         if qid in (None, "", "0"):
             for om in out_msgs:
                 od = om.get("decoded_body") or {}
                 qid = str(od.get("query_id", ""))
                 if qid:
                     break
+
         if not qid or qid == "0":
             continue
 
-        bucket = buckets.setdefault(qid, {"notify": None, "swap": None, "pay": None, "transfer": None})
+        bucket = buckets.setdefault(qid, {"swap": None, "pay": None})
 
-        if role == "notify":
-            bucket["notify"] = {"tx_hash": tx.get("hash"), "in_msg": in_msg}
+        if in_op == IN_OP_POOLV3_SWAP and bucket.get("swap") is None:
+            bucket["swap"] = {"tx_hash": tx.get("hash"), "in_msg": in_msg}
 
         for om in out_msgs:
             op = (om.get("op_code", "") or "").lower()
-            if op == OUT_OP_PAYOUT_FROM_POOL and bucket.get("transfer") is None:
-                bucket["transfer"] = {"tx_hash": tx.get("hash"), "out_msg": om}
-            if op == OUT_OP_DEDUST_SWAP and bucket.get("swap") is None:
-                bucket["swap"] = {"tx_hash": tx.get("hash"), "out_msg": om}
+            if op == OUT_OP_PAY_TO and bucket.get("pay") is None:
+                bucket["pay"] = {"tx_hash": tx.get("hash"), "out_msg": om}
 
     rows: List[Dict[str, Any]] = []
     for qid, parts in buckets.items():
@@ -183,7 +218,7 @@ def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         meta = extract_meta(parts)
         amounts = compute_amounts(parts, direction)
-        if not is_successful_swap(parts, direction, amounts):
+        if not is_successful_swap(direction, amounts):
             continue
         rows.append({"query_id": qid, "direction": direction, **meta, **amounts, **parts})
 
@@ -191,16 +226,16 @@ def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Fetch DeDust Classic swaps via tonapi and output NDJSON.")
+    parser = argparse.ArgumentParser(description="Fetch TONCO swaps via tonapi and output NDJSON.")
     parser.add_argument(
         "--api-url",
         default=(os.getenv("NEXT_PUBLIC_TON_API_BASE_URL") or "https://tonapi.io") + "/v2/blockchain",
         help="tonapi base URL",
     )
     parser.add_argument(
-        "--router",
-        default=os.getenv("TON_ROUTER", DEDUST_TON_USDT_POOL_ADDR),
-        help="Pool account address",
+        "--pool",
+        default=os.getenv("TONCO_POOL_ADDR", TONCO_TON_USDT_POOL_ADDR),
+        help="TONCO pool account address",
     )
     parser.add_argument("--limit", type=int, default=50, help="Page size (tonapi limit)")
     parser.add_argument("--pages", type=int, default=20, help="How many pages to fetch (pagination backward by lt)")
@@ -221,13 +256,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     txs = fetch_pages(
         api_url=args.api_url,
-        router=args.router,
+        pool=args.pool,
         limit=args.limit,
         pages=args.pages,
         api_key=args.api_key,
         before_lt=args.before_lt,
         cutoff_utime=cutoff_utime,
     )
+
     rows = build_bundles(txs)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
