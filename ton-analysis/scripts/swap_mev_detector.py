@@ -111,10 +111,11 @@ def compute_rates(rows):
     rates = []
     rates_by_dir = {"TON->USDT": [], "USDT->TON": []}
     for r in rows:
-        if r["direction"] == "TON->USDT":
-            val = Decimal(1) / Decimal(r["rate"])
-        else:  # USDT->TON
+        if r["direction"] == "USDT->TON":
+            # Already USDT per TON
             val = Decimal(r["rate"])
+        else:  # TON->USDT -> invert to USDT per TON
+            val = Decimal(1) / Decimal(r["rate"])
         rates.append(val * SCALE)
         if r["direction"] in rates_by_dir:
             rates_by_dir[r["direction"]].append(val * SCALE)
@@ -127,8 +128,8 @@ def sanity_filter(rows):
     """Filter obvious outliers by loose direction-specific ranges.
 
     Rationale (keep simple):
-    - USDT->TON expected rate ~0.0015 (USDT/TON). TON<->TON swaps show rate≈1, so drop anything >0.01 or <1e-6.
-    - TON->USDT expected ~600-700 (TON/USDT inverse). Drop anything far outside 10-5000 to avoid dividing errors/extremes.
+    - USDT->TON expected rate is large (~600; USDT per TON). Drop anything <=0 or absurdly high (e.g., >5000) to avoid TON<->TON noise or malformed rows.
+    - TON->USDT expected rate is small (~0.0015; TON per USDT). Drop anything <=0 or too large (e.g., >=0.01) to exclude inverted/outlier values.
     """
 
     filtered = []
@@ -136,11 +137,13 @@ def sanity_filter(rows):
     for r in rows:
         rate = Decimal(r["rate"])
         if r.get("direction") == "USDT->TON":
-            if rate <= Decimal("0") or rate >= Decimal("1000000"):
+            # USDT->TON は rate ~600 (USDT/TON)
+            if rate <= Decimal("0") or rate >= Decimal("5000"):
                 dropped.append((r, "usdt_ton_sanity"))
                 continue
         elif r.get("direction") == "TON->USDT":
-            if rate <= Decimal("0") or rate >= Decimal("1000"):
+            # TON->USDT は rate ~0.0015 (TON/USDT)
+            if rate <= Decimal("0") or rate >= Decimal("0.01"):
                 dropped.append((r, "ton_usdt_sanity"))
                 continue
         filtered.append(r)

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 DEFAULT_OUT = "ton-analysis/data/stonfi_swaps_latest.ndjson"
+DEFAULT_RAW_OUT = "ton-analysis/data/stonfi_swaps_tonapi_raw.ndjson"
 TON_ROUTER = "EQCS4UEa5UaJLzOyyKieqQOQ2P9M-7kXpkO5HnP3Bv250cN3"
 
 # precision for rate
@@ -29,8 +30,8 @@ OUT_OP_SWAP_V2 = "0x6664de2a"
 OUT_OP_TRANSFER = "0x0f8a7ea5"
 
 # Wallets to decide direction
-PTON_WALLET = "0:922d627d7d8edbd00e4e23bdb0c54a76ee5e1f46573a1af4417857fa3e23e91f"
-USDT_WALLET = "0:9220c181a6cfeacd11b7b8f62138df1bb9cc82b6ed2661d2f5faee204b3efb20"
+USDT_WALLET = "0:922d627d7d8edbd00e4e23bdb0c54a76ee5e1f46573a1af4417857fa3e23e91f"
+PTON_WALLET = "0:9220c181a6cfeacd11b7b8f62138df1bb9cc82b6ed2661d2f5faee204b3efb20"
 
 
 def fetch_page(api_url: str, router: str, limit: int, api_key: Optional[str], before_lt: Optional[int]) -> List[Dict[str, Any]]:
@@ -80,28 +81,18 @@ def fetch_pages(
 
 
 def infer_direction(parts: Dict[str, Any]) -> str:
-    def norm(addr: str) -> str:
-        return (addr or "").lower()
+    """Infer swap direction using swap.dex_payload.token_wallet1 only.
 
-    transfer = parts.get("transfer") or {}
-    t_dest = norm(((transfer.get("out_msg") or {}).get("decoded_body") or {}).get("destination", ""))
-    if t_dest == norm(USDT_WALLET):
-        return "TON->USDT"
-    if t_dest == norm(PTON_WALLET):
-        return "USDT->TON"
+    Observed data shows all rows can be classified by this field; other fallbacks unused.
+    """
 
-    notify = parts.get("notify") or {}
-    n_sender = norm(((notify.get("in_msg") or {}).get("decoded_body") or {}).get("sender", ""))
-    if n_sender == norm(USDT_WALLET):
-        return "USDT->TON"
-    if n_sender == norm(PTON_WALLET):
-        return "TON->USDT"
+    swap_wallet1 = (((parts.get("swap") or {}).get("out_msg") or {}).get("decoded_body") or {}).get(
+        "dex_payload", {}
+    ).get("token_wallet1")
 
-    swap = parts.get("swap") or {}
-    token_wallet1 = norm(((swap.get("out_msg") or {}).get("decoded_body") or {}).get("dex_payload", {}).get("token_wallet1", ""))
-    if token_wallet1 == norm(USDT_WALLET):
+    if swap_wallet1 == USDT_WALLET:
         return "TON->USDT"
-    if token_wallet1 == norm(PTON_WALLET):
+    if swap_wallet1 == PTON_WALLET:
         return "USDT->TON"
 
     return "unknown"
@@ -109,19 +100,11 @@ def infer_direction(parts: Dict[str, Any]) -> str:
 
 def extract_meta(parts: Dict[str, Any]) -> Dict[str, Any]:
     notify = parts.get("notify") or {}
-    transfer = parts.get("transfer") or {}
-
-    def pick_lt_utime(msg: Dict[str, Any]) -> Dict[str, Any]:
-        lt = (msg.get("in_msg") or msg.get("out_msg") or {}).get("created_lt")
-        utime = (msg.get("in_msg") or msg.get("out_msg") or {}).get("created_at")
-        return {"lt": lt, "utime": utime}
-
-    n_meta = pick_lt_utime(notify) if notify else {"lt": None, "utime": None}
-    t_meta = pick_lt_utime(transfer) if transfer else {"lt": None, "utime": None}
-
-    lt = n_meta.get("lt") or t_meta.get("lt")
-    utime = n_meta.get("utime") or t_meta.get("utime")
-    return {"lt": lt, "utime": utime}
+    meta = {
+        "lt": (notify.get("in_msg") or {}).get("created_lt"),
+        "utime": (notify.get("in_msg") or {}).get("created_at"),
+    }
+    return meta
 
 
 def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
@@ -140,14 +123,14 @@ def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
     out_amt = None
 
     if direction == "TON->USDT":
+        # Notify amount is the authoritative TON input; fallback is not used (observed unused).
         in_amt = d(((notify.get("decoded_body") or {}).get("amount")))
-        if in_amt is None:
-            in_amt = d(((pay.get("decoded_body") or {}).get("amount0_out")))
         out_amt = d(((transfer.get("decoded_body") or {}).get("amount")))
     elif direction == "USDT->TON":
-        in_amt = d(((swap.get("decoded_body") or {}).get("right_amount")))
-        if in_amt is None:
-            in_amt = d(((pay.get("decoded_body") or {}).get("amount1_out")))
+        # For USDT input, jetton_notify.amount is the authoritative source (fallbacks unused in recent data).
+        in_amt = d(((notify.get("decoded_body") or {}).get("amount")))
+
+        # Output uses transfer amount only.
         out_amt = d(((transfer.get("decoded_body") or {}).get("amount")))
 
     rate = None
@@ -165,29 +148,49 @@ def compute_amounts(parts: Dict[str, Any], direction: str) -> Dict[str, Any]:
 
 
 def is_successful_swap(parts: Dict[str, Any], direction: str, amounts: Dict[str, Any]) -> bool:
-    """Success criteria to exclude refunds (repay):
+    """Determine swap success / filter refunds.
 
-    - pay.in_msg.decoded_body.exit_code == 3326308581 (normal success)
-    - Output token amount is non-zero (TON->USDT uses amount1_out, USDT->TON uses amount0_out)
+    Rules:
+    - If pay is present: require exit_code == 3326308581 and additional_info output > 0.
+    - Always require transfer amount > 0 (primary output signal).
+    - If pay is absent but transfer is present: allow (best-effort) if transfer amount > 0.
+    - Drop obvious refunds: in_amount == out_amount and (rate == "1" or rate == "1.0...").
     """
 
-    pay_decoded = ((parts.get("pay") or {}).get("in_msg") or {}).get("decoded_body") or {}
-    exit_code = pay_decoded.get("exit_code")
+    out_amt_str = amounts.get("out_amount")
+    in_amt_str = amounts.get("in_amount")
+    rate_str = amounts.get("rate")
 
-    # treat as failed if exit code is not success
-    if exit_code != 3326308581:
+    transfer_decoded = ((parts.get("transfer") or {}).get("out_msg") or {}).get("decoded_body") or {}
+    transfer_amount = transfer_decoded.get("amount")
+
+    pay_decoded = ((parts.get("pay") or {}).get("in_msg") or {}).get("decoded_body") or {}
+    add_info = (pay_decoded.get("additional_info") or {}) if pay_decoded else {}
+
+    out_from_pay = None
+    if direction == "TON->USDT":
+        out_from_pay = add_info.get("amount1_out")
+    else:
+        out_from_pay = add_info.get("amount0_out")
+
+    output_ok = False
+    if transfer_amount not in (None, "0"):
+        output_ok = True
+    if out_from_pay not in (None, "0"):
+        output_ok = True
+    if not output_ok:
         return False
 
-    add_info = pay_decoded.get("additional_info") or {}
-    out_amt_str = amounts.get("out_amount")
+    # Refund heuristic: identical in/out and rate ~1
+    if in_amt_str is not None and out_amt_str is not None:
+        try:
+            if Decimal(in_amt_str) == Decimal(out_amt_str):
+                if rate_str and str(rate_str).startswith("1"):
+                    return False
+        except Exception:
+            pass
 
-    if direction == "TON->USDT":
-        # If USDT output is 0, treat as refund
-        amount1_out = add_info.get("amount1_out")
-        return bool(amount1_out) and amount1_out != "0" and out_amt_str not in (None, "0")
-    else:  # USDT->TON
-        amount0_out = add_info.get("amount0_out")
-        return bool(amount0_out) and amount0_out != "0" and out_amt_str not in (None, "0")
+    return True
 
 
 def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -240,8 +243,11 @@ def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         meta = extract_meta(parts)
         amounts = compute_amounts(parts, direction)
+
+        # Filter out refunds / failed swaps
         if not is_successful_swap(parts, direction, amounts):
             continue
+
         rows.append({"query_id": qid, "direction": direction, **meta, **amounts, **parts})
 
     return rows
@@ -260,6 +266,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--before-lt", type=int, default=None, help="Optional before_lt for pagination anchor")
     parser.add_argument("--max-age-mins", type=int, default=None, help="Stop when tx utime older than now - max_age_min")
     parser.add_argument("--out", default=DEFAULT_OUT, help="NDJSON output path")
+    parser.add_argument("--raw-out", default=DEFAULT_RAW_OUT, help="Optional: save raw tonapi txs to NDJSON")
     parser.add_argument(
         "--api-key",
         default=os.getenv("NEXT_PUBLIC_TON_API_KEY") or os.getenv("TON_API_KEY_MAINNET"),
@@ -280,6 +287,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         before_lt=args.before_lt,
         cutoff_utime=cutoff_utime,
     )
+
+    # Save raw tonapi transactions if requested
+    if args.raw_out:
+        raw_path = os.path.abspath(args.raw_out)
+        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+        with open(raw_path, "w", encoding="utf-8") as f_raw:
+            for tx in txs:
+                f_raw.write(json.dumps(tx, ensure_ascii=False) + "\n")
+        print(f"saved raw tonapi txs: {len(txs)} -> {raw_path}")
+
     rows = build_bundles(txs)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
