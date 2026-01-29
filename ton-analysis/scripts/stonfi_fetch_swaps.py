@@ -215,13 +215,13 @@ def build_bundles(txs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if in_op in {IN_OP_NOTIFY, IN_OP_PAY_V2}:
             qid = str((in_msg.get("decoded_body") or {}).get("query_id", ""))
             role = "notify" if in_op == IN_OP_NOTIFY else "pay"
-        if qid in (None, ""):
+        if qid in (None, "", "0"):
             for om in out_msgs:
                 od = om.get("decoded_body") or {}
                 qid = str(od.get("query_id", ""))
                 if qid:
                     break
-        if not qid:
+        if not qid or qid == "0":
             continue
 
         bucket = buckets.setdefault(qid, {"notify": None, "swap": None, "pay": None, "transfer": None})
