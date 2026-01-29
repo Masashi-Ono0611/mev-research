@@ -79,6 +79,9 @@
   - 現行サンプル: min_out 欠損なし（with_min_out=31, missing=0）、例: hit_pct max ≈99.97%, median=99.00%, mean≈95.48%。
   - 留意: hit_pctはユーザー設定の許容幅に依存。見積価格が無いため被害額は前後Txや外部価格を用いて評価する必要あり。
 
+## 実行環境メモ
+- Python: Homebrew の python@3.12（/opt/homebrew/bin/python3.12）
+- 仮想環境: `.venv` を使用（`source .venv/bin/activate`）
 
 ## 次のステップ案
 - スワップログ取得スクリプト雛形を作成し、24hデータをpull。
